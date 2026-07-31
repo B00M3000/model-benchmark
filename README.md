@@ -101,11 +101,23 @@ Requires JetPack 5.1+ with CUDA, cuDNN and TensorRT.
 ```bash
 git clone <this repo> && cd model-benchmark
 python3 -m venv .venv --system-site-packages   # inherit JetPack's torch/TensorRT
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements-jetson.txt
 ```
 
-`--system-site-packages` matters: the Jetson's `torch`, `torchvision` and
-`tensorrt` come from JetPack and must not be replaced by pip wheels.
+Use **`requirements-jetson.txt`**, not `requirements.txt` — the latter is for
+x86 development and installs an OpenCV wheel that drags in NumPy 2.
+
+`--system-site-packages` matters: the Jetson's `torch`, `torchvision`,
+`tensorrt` and `cv2` come from JetPack and must not be replaced by pip wheels.
+Two constraints follow, and both cause failures far from their cause:
+
+- **NumPy must stay on 1.x.** JetPack's torch is compiled against NumPy 1.x.
+  NumPy 2 leaves torch importable but breaks its C bridge, so `torch.from_numpy`
+  fails with *"Numpy is not available"* — surfacing inside NanoOWL, not at
+  install time.
+- **OpenCV should come from JetPack** (`sudo apt install python3-opencv`). The
+  PyPI wheel is CPU-only, lacks the hardware decoders, and 4.11+ requires
+  NumPy 2, which reintroduces the problem above.
 
 Then install the three model repos against that same environment. **Always pass
 `--no-deps`** — all three declare `torch` as a dependency, and pip will happily
@@ -144,6 +156,21 @@ between machines):
 ```bash
 ./scripts/build_engines.sh
 ```
+
+### "Numpy is not available" / "compiled using NumPy 1.x cannot be run in NumPy 2"
+
+NumPy 2 was installed over JetPack's NumPy 1.x. torch still imports, but its
+numpy bridge is dead, so `torch.from_numpy` fails — which is why this surfaces
+inside NanoOWL's `_owl_compute_box_bias` rather than at import.
+
+```bash
+.venv/bin/pip install 'numpy<2'
+```
+
+If pip then complains that OpenCV requires NumPy 2, use JetPack's OpenCV instead
+of the wheel (`sudo apt install python3-opencv`, plus `--system-site-packages`
+on the venv), or pin `opencv-python-headless==4.10.0.84`, the last release that
+resolves against NumPy 1.x.
 
 ### "operator torchvision::nms does not exist"
 

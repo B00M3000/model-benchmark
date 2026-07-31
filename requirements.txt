@@ -1,9 +1,7 @@
-# Web app + measurement harness.
+# Development / x86 requirements.
 #
-# The model backends themselves (nanoowl, nanosam, efficientvit) are NOT
-# listed here: on a Jetson they are installed from source against the
-# JetPack-provided torch/TensorRT build, and pip would happily pull an
-# incompatible x86 wheel over the top. See scripts/build_engines.sh.
+# ON A JETSON, USE requirements-jetson.txt INSTEAD. This file installs an
+# OpenCV wheel that drags in NumPy 2, which breaks JetPack's torch.
 
 fastapi>=0.110
 uvicorn[standard]>=0.27
@@ -11,11 +9,7 @@ python-multipart>=0.0.9
 pydantic>=2.5
 pyyaml>=6.0
 numpy>=1.24
-
-# On a Jetson prefer the JetPack OpenCV build (python3-opencv) over this
-# wheel, which is CPU-only and lacks the hardware-accelerated decoders.
 opencv-python-headless>=4.8
-
 pillow>=10.0
 
 # Development / test only

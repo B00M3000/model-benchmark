@@ -1,0 +1,41 @@
+# Jetson Orin requirements.
+#
+#   python3 -m venv .venv --system-site-packages
+#   .venv/bin/pip install -r requirements-jetson.txt
+#
+# --system-site-packages is required: torch, torchvision, tensorrt and cv2
+# all come from JetPack and must NOT be installed by pip. Deliberately
+# absent from this file:
+#
+#   torch / torchvision  pip wheels are built for a newer CUDA than the
+#                        Jetson driver supports, and replacing JetPack's
+#                        build gives "The NVIDIA driver on your system is
+#                        too old". Install only from a JetPack-matched
+#                        index, and always both together.
+#   tensorrt             ships with JetPack.
+#   opencv               use JetPack's build (apt install python3-opencv).
+#                        The PyPI wheel is CPU-only, lacks the hardware
+#                        decoders, and requires NumPy 2 (see below).
+#
+# Verify the result with: python3 scripts/doctor.py
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+pydantic>=2.5
+pyyaml>=6.0
+pillow>=10.0
+
+# NumPy MUST stay on 1.x. JetPack's torch is compiled against NumPy 1.x;
+# NumPy 2 leaves torch importable but breaks its C bridge, so torch.from_numpy
+# fails with "Numpy is not available" -- which surfaces deep inside NanoOWL
+# rather than at install time.
+numpy>=1.24,<2
+
+# If JetPack's cv2 really is unavailable, this is the newest OpenCV wheel that
+# still resolves against NumPy 1.x (4.11+ and all of 5.x require NumPy 2):
+#   pip install opencv-python-headless==4.10.0.84
+
+# Test only
+pytest>=8.0
+httpx>=0.27

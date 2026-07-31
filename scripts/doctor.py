@@ -119,6 +119,10 @@ def check_torch() -> None:
 
     ok("torch", f"{version}  (built for CUDA {built_for})  {torch.__file__}")
 
+    # Checked before the CUDA early-returns below: a broken numpy bridge
+    # breaks NanoOWL regardless of whether CUDA works.
+    check_numpy(torch)
+
     if not is_jetpack_build and driver is not None:
         warn(
             "This does not look like a JetPack build of torch",
@@ -155,6 +159,35 @@ def check_torch() -> None:
 
     ok("torch.cuda", f"{torch.cuda.get_device_name(0)}")
     check_torchvision(torch)
+
+
+def check_numpy(torch) -> None:
+    """JetPack's torch is built against NumPy 1.x; NumPy 2 breaks its bridge.
+
+    torch still imports cleanly, so this only shows up when something calls
+    ``torch.from_numpy`` -- which NanoOWL does during construction. Exercise
+    it here instead.
+    """
+    try:
+        import numpy
+    except ImportError:
+        bad("numpy not importable", fix="pip install 'numpy<2'")
+        return
+
+    try:
+        torch.from_numpy(numpy.zeros(1, dtype=numpy.float32))
+        ok("numpy", f"{numpy.__version__}  (torch.from_numpy works)")
+    except Exception as exc:
+        major = numpy.__version__.split(".")[0]
+        detail = f"numpy {numpy.__version__}: {str(exc).splitlines()[0]}"
+        if major.isdigit() and int(major) >= 2:
+            fix = (
+                "JetPack's torch is compiled against NumPy 1.x and cannot use "
+                "NumPy 2.\n    pip install 'numpy<2'"
+            )
+        else:
+            fix = "torch and numpy are incompatible; reinstall both."
+        bad("torch cannot convert numpy arrays", detail, fix)
 
 
 MATCHED_PAIR_FIX = (
@@ -220,6 +253,32 @@ def check_torchvision(torch) -> None:
             f"{type(exc).__name__}: {str(exc).splitlines()[0]}",
             MATCHED_PAIR_FIX,
         )
+
+
+def check_opencv() -> None:
+    section("OpenCV")
+    try:
+        import cv2
+    except ImportError:
+        bad(
+            "cv2 not importable",
+            fix="On the Jetson: sudo apt install python3-opencv, and create the "
+                "venv with --system-site-packages.",
+        )
+        return
+
+    ok("cv2", f"{cv2.__version__}  {cv2.__file__}")
+    if "site-packages" in cv2.__file__ and "dist-packages" not in cv2.__file__:
+        warn(
+            "cv2 looks like a pip wheel rather than JetPack's build",
+            fix="The PyPI wheel is CPU-only, lacks the hardware decoders, and "
+                "requires NumPy 2 -- which breaks JetPack's torch. Prefer "
+                "python3-opencv.",
+        )
+
+    # Video decode is the one thing this app actually needs from OpenCV.
+    if not hasattr(cv2, "VideoCapture"):
+        bad("cv2.VideoCapture missing", "this OpenCV build cannot decode video")
 
 
 def check_tensorrt() -> None:
@@ -333,6 +392,7 @@ def main() -> int:
     for check in (
         check_platform,
         check_torch,
+        check_opencv,
         check_tensorrt,
         check_models,
         check_artifacts,
