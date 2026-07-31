@@ -212,3 +212,41 @@ def test_segmenters_report_distinct_costs(synthetic_video, mock_config):
     b_seg = results["b"].stages["seg_encode"].mean
     # Mock EfficientViT is configured to be the heavier encoder.
     assert b_seg > a_seg
+
+
+# ── import-path escape hatch ────────────────────────────────────────────
+def test_repo_paths_make_a_clone_importable(tmp_path, mock_config, monkeypatch):
+    """A plain git clone must be usable without `pip install -e`.
+
+    JetPack's setuptools/packaging pair frequently breaks editable installs,
+    which must not block a benchmark run.
+    """
+    import sys
+
+    from benchmark.models.registry import ensure_repo_paths, missing_jetson_modules
+
+    clone = tmp_path / "fake_repo"
+    (clone / "nanoowl").mkdir(parents=True)
+    (clone / "nanoowl" / "__init__.py").write_text("")
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert "nanoowl" in missing_jetson_modules(mock_config)
+
+    mock_config.repo_paths = [str(clone)]
+    added = ensure_repo_paths(mock_config)
+    assert added == [str(clone)]
+    assert "nanoowl" not in missing_jetson_modules(mock_config)
+
+    # Idempotent: a second call must not stack duplicates onto sys.path.
+    assert ensure_repo_paths(mock_config) == []
+    assert sys.path.count(str(clone)) == 1
+
+
+def test_repo_paths_ignores_missing_directories(mock_config, monkeypatch):
+    import sys
+
+    from benchmark.models.registry import ensure_repo_paths
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    mock_config.repo_paths = ["/nonexistent/path/to/nowhere"]
+    assert ensure_repo_paths(mock_config) == []

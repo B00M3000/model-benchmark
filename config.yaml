@@ -9,6 +9,17 @@
 # mock   - CPU stand-ins with synthetic latency, for development only
 backend: auto
 
+# Directories prepended to sys.path before the backends are imported. Point
+# these at plain git clones to skip `pip install -e` entirely -- handy on
+# JetPack, where the system setuptools and packaging versions often disagree
+# and editable installs fail for reasons unrelated to the models. Each path
+# should be the repo root, i.e. the directory containing the package folder.
+repo_paths: []
+# repo_paths:
+#   - ../nanoowl
+#   - ../nanosam
+#   - ../efficientvit
+
 nanoowl:
   model_name: google/owlvit-base-patch32
   image_encoder_engine: data/owl_image_encoder_patch32.engine

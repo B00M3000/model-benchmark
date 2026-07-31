@@ -112,6 +112,13 @@ class AppConfig(BaseModel):
     #: "auto" picks real backends when importable, else mock. Force with
     #: "jetson" (fail loudly if unavailable) or "mock".
     backend: Literal["auto", "jetson", "mock"] = "auto"
+
+    #: Directories prepended to sys.path before the backends are imported.
+    #: Point these at plain git clones of nanoowl / nanosam / efficientvit to
+    #: skip `pip install -e` entirely -- useful on JetPack, where the system
+    #: setuptools and packaging versions frequently disagree and editable
+    #: installs fail for reasons unrelated to the models themselves.
+    repo_paths: list[str] = Field(default_factory=list)
     nanoowl: NanoOwlConfig = Field(default_factory=NanoOwlConfig)
     nanosam: NanoSamConfig = Field(default_factory=NanoSamConfig)
     efficientvit: EfficientViTConfig = Field(default_factory=EfficientViTConfig)

@@ -827,9 +827,15 @@ async function init() {
     state.serverConfig = config;
     const badge = $('backend-badge');
     if (config.is_mock) {
+      const missing = config.missing_modules || [];
       badge.className = 'badge badge-mock';
-      badge.textContent = '⚠ mock backend — synthetic numbers';
-      badge.title = 'Jetson libraries are not importable on this host. '
+      badge.textContent = missing.length
+        ? `⚠ mock — missing ${missing.join(', ')}`
+        : '⚠ mock backend — synthetic numbers';
+      badge.title = (missing.length
+        ? `Not importable on this host: ${missing.join(', ')}. Install them, or point `
+          + `repo_paths in config.yaml at their git clones.\n\n`
+        : '')
         + 'Latencies are synthetic and must not be used as study data.';
     } else {
       badge.className = 'badge badge-live';

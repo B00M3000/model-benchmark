@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import REPO_ROOT, AppConfig, load_config
 from .jobs import QUEUED, JobManager
-from .models.registry import PAIRINGS, jetson_backends_available, resolve_backend
+from .models.registry import PAIRINGS, missing_jetson_modules, resolve_backend
 from .pipeline import RunConfig
 
 ALLOWED_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -48,10 +48,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.get("/api/config")
     async def get_config() -> dict[str, Any]:
         backend = resolve_backend(config)
+        missing = missing_jetson_modules(config)
         return {
             "backend": backend,
             "is_mock": backend == "mock",
-            "jetson_libraries_present": jetson_backends_available(),
+            "jetson_libraries_present": not missing,
+            # Named explicitly so a half-finished install is diagnosable from
+            # the UI instead of just reporting "mock".
+            "missing_modules": missing,
             "pairings": [
                 {
                     "id": p.pairing_id,

@@ -128,6 +128,44 @@ between machines):
 ./scripts/build_engines.sh
 ```
 
+### If `pip install -e` fails
+
+JetPack images frequently ship a setuptools newer than their `packaging`, and
+editable installs then die with:
+
+```
+TypeError: canonicalize_version() got an unexpected keyword argument 'strip_trailing_zero'
+```
+
+`strip_trailing_zero` landed in packaging 23.2, so the fix is to align the pair
+inside the venv (which shadows the system copies without touching JetPack):
+
+```bash
+.venv/bin/pip install -U pip setuptools wheel "packaging>=23.2"
+```
+
+If it persists, pin setuptools back below the change instead:
+
+```bash
+.venv/bin/pip install -U "setuptools<69.3"
+.venv/bin/pip install -e efficientvit --no-build-isolation
+```
+
+**Or skip the install entirely.** None of the three repos need to be installed —
+point `repo_paths` in `config.yaml` at the clones and they are imported straight
+from source:
+
+```yaml
+repo_paths:
+  - ../nanoowl
+  - ../nanosam
+  - ../efficientvit
+```
+
+Each path is the repo root, i.e. the directory containing the package folder.
+The UI badge names any module it still cannot import, so a half-finished install
+is diagnosable at a glance rather than silently falling back to mock.
+
 <br>
 
 ## Run

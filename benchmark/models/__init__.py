@@ -9,7 +9,9 @@ from .registry import (
     Pairing,
     build_detector,
     build_segmenter,
+    ensure_repo_paths,
     jetson_backends_available,
+    missing_jetson_modules,
     resolve_backend,
 )
 
@@ -27,6 +29,8 @@ __all__ = [
     "Pairing",
     "build_detector",
     "build_segmenter",
+    "ensure_repo_paths",
     "jetson_backends_available",
+    "missing_jetson_modules",
     "resolve_backend",
 ]

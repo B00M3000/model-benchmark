@@ -6,12 +6,18 @@ segmentation head -- that is the whole point of the ablation.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
+import logging
+import os
+import sys
 from dataclasses import dataclass
 from typing import Callable
 
 from ..config import AppConfig
 from .base import Detector, Segmenter
+
+logger = logging.getLogger(__name__)
 
 PAIRING_A = "a"
 PAIRING_B = "b"
@@ -46,12 +52,54 @@ PAIRINGS: tuple[Pairing, ...] = (
 PAIRING_BY_ID = {p.pairing_id: p for p in PAIRINGS}
 
 
-def jetson_backends_available() -> bool:
+JETSON_MODULES = ("nanoowl", "nanosam", "efficientvit")
+
+
+def ensure_repo_paths(config: AppConfig) -> list[str]:
+    """Prepend configured repo clones to ``sys.path``.
+
+    Lets the model repos be imported straight from a git clone, so a failed
+    ``pip install -e`` -- a common JetPack problem, where the system
+    setuptools and packaging versions disagree -- does not block a run.
+
+    Idempotent: safe to call on every backend resolution.
+    """
+    added: list[str] = []
+    for raw in config.repo_paths:
+        path = config.resolve_path(raw)
+        if not path:
+            continue
+        if not os.path.isdir(path):
+            logger.warning("repo_paths entry does not exist, skipping: %s", path)
+            continue
+        if path not in sys.path:
+            sys.path.insert(0, path)
+            added.append(path)
+    if added:
+        # find_spec caches directory listings; without this a path added
+        # after startup would not be seen.
+        importlib.invalidate_caches()
+    return added
+
+
+def missing_jetson_modules(config: AppConfig | None = None) -> list[str]:
+    """Which of the three model packages cannot be imported on this host."""
+    if config is not None:
+        ensure_repo_paths(config)
+    missing = []
+    for module in JETSON_MODULES:
+        try:
+            found = importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(module)
+    return missing
+
+
+def jetson_backends_available(config: AppConfig | None = None) -> bool:
     """True when all three Jetson packages are importable on this host."""
-    return all(
-        importlib.util.find_spec(mod) is not None
-        for mod in ("nanoowl", "nanosam", "efficientvit")
-    )
+    return not missing_jetson_modules(config)
 
 
 def resolve_backend(config: AppConfig) -> str:
@@ -63,9 +111,10 @@ def resolve_backend(config: AppConfig) -> str:
     """
     if config.backend == "mock":
         return "mock"
+    ensure_repo_paths(config)
     if config.backend == "jetson":
         return "jetson"
-    return "jetson" if jetson_backends_available() else "mock"
+    return "jetson" if jetson_backends_available(config) else "mock"
 
 
 def build_detector(config: AppConfig, backend: str) -> Detector:
