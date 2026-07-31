@@ -171,13 +171,13 @@ def parse_cuda(text: str | None) -> tuple[int, int] | None:
 def jetson_wheel_index(driver: int | None) -> str:
     """NVIDIA's wheel index matching the driver's CUDA version."""
     cuda = f"cu{fmt_cuda(driver).replace('.', '')}" if driver else "cu126"
-    return f"https://pypi.jetson-ai-lab.dev/jp6/{cuda}"
+    return f"https://pypi.jetson-ai-lab.io/jp6/{cuda}"
 
 
 JETSON_TORCH_FIX = (
     "Install a Jetson-matched build instead, e.g. for JetPack 6.x / CUDA 12.6:\n    "
     "  pip install --no-cache-dir --index-url "
-    "https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision\n    "
+    "https://pypi.jetson-ai-lab.io/jp6/cu126 torch torchvision\n    "
     "Then install the model repos with --no-deps so pip cannot replace it again."
 )
 
@@ -325,7 +325,7 @@ MATCHED_PAIR_FIX = (
     "Reinstall BOTH together, never one alone -- for JetPack 6.x / CUDA 12.6:\n    "
     "  pip uninstall -y torch torchvision\n    "
     "  pip install --no-cache-dir --index-url "
-    "https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision"
+    "https://pypi.jetson-ai-lab.io/jp6/cu126 torch torchvision"
 )
 
 

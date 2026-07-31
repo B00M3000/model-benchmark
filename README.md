@@ -232,7 +232,7 @@ Install them **together, from the same index**, never one alone:
 
 ```bash
 .venv/bin/pip uninstall -y torch torchvision
-.venv/bin/pip install --no-cache-dir --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision
+.venv/bin/pip install --no-cache-dir --index-url https://pypi.jetson-ai-lab.io/jp6/cu126 torch torchvision
 ```
 
 Importing torchvision is not sufficient proof that it works — the failure above
@@ -254,7 +254,7 @@ JetPack wheels carry an `.nv` suffix (`2.5.0a0+872d972e41.nv24.08`). A bare
 matched pair for your JetPack — for JetPack 6.x / CUDA 12.6:
 
 ```bash
-pip install --no-cache-dir --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision
+pip install --no-cache-dir --index-url https://pypi.jetson-ai-lab.io/jp6/cu126 torch torchvision
 ```
 
 `torch` and `torchvision` must come from the same index; a mismatched pair fails
