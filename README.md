@@ -145,6 +145,28 @@ between machines):
 ./scripts/build_engines.sh
 ```
 
+### "operator torchvision::nms does not exist"
+
+torchvision's compiled extension was built against a different torch than the
+one being imported. Check where each one lives:
+
+```bash
+python3 -c "import torch, torchvision; print(torch.__file__); print(torchvision.__file__)"
+```
+
+If one is in `.venv/lib/...` and the other in `/usr/local/lib/python3.10/dist-packages`,
+that's the problem — a venv torchvision paired with the system JetPack torch.
+Install them **together, from the same index**, never one alone:
+
+```bash
+.venv/bin/pip uninstall -y torch torchvision
+.venv/bin/pip install --no-cache-dir --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision
+```
+
+Importing torchvision is not sufficient proof that it works — the failure above
+happens at import, but a subtler mismatch can import cleanly and only fail when
+an op is called. `scripts/doctor.py` actually invokes `nms` to confirm.
+
 ### "The NVIDIA driver on your system is too old (found version 12060)"
 
 The torch being imported was built against a newer CUDA than the Jetson driver

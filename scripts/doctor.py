@@ -154,16 +154,71 @@ def check_torch() -> None:
         return
 
     ok("torch.cuda", f"{torch.cuda.get_device_name(0)}")
+    check_torchvision(torch)
+
+
+MATCHED_PAIR_FIX = (
+    "torch and torchvision must be a matched pair from the same build.\n    "
+    "Reinstall BOTH together, never one alone -- for JetPack 6.x / CUDA 12.6:\n    "
+    "  pip uninstall -y torch torchvision\n    "
+    "  pip install --no-cache-dir --index-url "
+    "https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision"
+)
+
+
+def check_torchvision(torch) -> None:
+    """NanoOWL imports torchvision.ops.roi_align, so this must actually work.
+
+    A torchvision whose compiled extension was built against a different
+    torch imports far enough to fail with "operator torchvision::nms does
+    not exist" -- so importability alone proves nothing, and the ops get
+    exercised below.
+    """
+    torch_root = Path(torch.__file__).resolve().parent.parent
 
     try:
         import torchvision
-
-        ok("torchvision", torchvision.__version__)
     except ImportError:
         bad(
             "torchvision not importable",
-            "NanoOWL needs it (torchvision.ops.roi_align)",
-            "Install the JetPack-matched torchvision -- the version must pair with torch.",
+            "NanoOWL needs torchvision.ops.roi_align",
+            MATCHED_PAIR_FIX,
+        )
+        return
+    except RuntimeError as exc:
+        bad(
+            "torchvision failed to load",
+            str(exc).splitlines()[0],
+            "Its compiled ops were built against a different torch.\n    "
+            + MATCHED_PAIR_FIX,
+        )
+        return
+
+    ok("torchvision", f"{torchvision.__version__}  {torchvision.__file__}")
+
+    # A venv torchvision alongside a system torch is the usual cause.
+    tv_root = Path(torchvision.__file__).resolve().parent.parent
+    if tv_root != torch_root:
+        warn(
+            "torch and torchvision are in different site-packages",
+            f"torch={torch_root}  torchvision={tv_root}",
+            "They are probably not a matched pair. " + MATCHED_PAIR_FIX,
+        )
+
+    try:
+        from torchvision.ops import nms, roi_align  # noqa: F401
+
+        nms(
+            torch.tensor([[0.0, 0.0, 10.0, 10.0], [1.0, 1.0, 11.0, 11.0]]),
+            torch.tensor([0.9, 0.8]),
+            0.5,
+        )
+        ok("torchvision ops", "nms / roi_align registered")
+    except Exception as exc:
+        bad(
+            "torchvision ops are not registered",
+            f"{type(exc).__name__}: {str(exc).splitlines()[0]}",
+            MATCHED_PAIR_FIX,
         )
 
 
