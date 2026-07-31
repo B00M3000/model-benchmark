@@ -242,6 +242,62 @@ def test_repo_paths_make_a_clone_importable(tmp_path, mock_config, monkeypatch):
     assert sys.path.count(str(clone)) == 1
 
 
+def test_repo_paths_handles_a_package_with_no_top_level_init(tmp_path, mock_config, monkeypatch):
+    """repo_paths must work for a package shaped exactly like nanosam.
+
+    NanoSAM's upstream repo ships with no nanosam/nanosam/__init__.py at all
+    -- only its submodules (nanosam/tools/__init__.py, etc.) have one. A
+    repo_paths entry pointed at the clone root therefore resolves nanosam
+    itself as a PEP 420 namespace package even when everything is set up
+    correctly, which looks identical -- spec.origin is None either way -- to
+    the broken case where sys.path is pointed one level too high, at the
+    clone root's *parent*, and the real content is a further level deeper
+    still. module_status() must tell these apart by checking for real
+    content, not just by whether origin is None.
+    """
+    import sys
+
+    from benchmark.models.registry import ensure_repo_paths, missing_jetson_modules, module_status
+
+    clone = tmp_path / "nanosam"  # the clone root; matches nanosam's own layout
+    (clone / "nanosam" / "tools").mkdir(parents=True)
+    (clone / "nanosam" / "tools" / "__init__.py").write_text("")
+    # Deliberately no (clone / "nanosam" / "__init__.py") -- nanosam has none either.
+    (clone / "setup.py").write_text("")  # present in every real clone; must not fool the check
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert "nanosam" in missing_jetson_modules(mock_config)
+
+    # Correct configuration: repo_paths points at the clone root itself.
+    mock_config.repo_paths = [str(clone)]
+    ensure_repo_paths(mock_config)
+    assert module_status("nanosam")[0] == "ok"
+    assert "nanosam" not in missing_jetson_modules(mock_config)
+
+
+def test_repo_paths_still_catches_a_genuine_shadow(tmp_path, mock_config, monkeypatch):
+    """The broken case the above test is contrasted with must still be caught.
+
+    Pointing repo_paths one level too high -- at the clone root's parent,
+    rather than the clone root itself -- must still be reported as not
+    usable, even for a package shaped like nanosam (no top-level __init__.py).
+    """
+    import sys
+
+    from benchmark.models.registry import ensure_repo_paths, module_status
+
+    parent = tmp_path / "wrong_level"
+    clone = parent / "nanosam"
+    (clone / "nanosam" / "tools").mkdir(parents=True)
+    (clone / "nanosam" / "tools" / "__init__.py").write_text("")
+    (clone / "setup.py").write_text("")
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    mock_config.repo_paths = [str(parent)]  # one level too high
+    ensure_repo_paths(mock_config)
+    assert module_status("nanosam")[0] == "shadowed"
+
+
 def test_repo_paths_ignores_missing_directories(mock_config, monkeypatch):
     import sys
 

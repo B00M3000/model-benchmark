@@ -145,34 +145,58 @@ else
     --fp16
 fi
 
+# Default: fetch a pre-built ONNX, exactly like the encoder above, rather
+# than exporting fresh with nanosam's own export script. This isn't for the
+# encoder's reason (avoiding Google Drive) -- exporting the mask decoder
+# fresh reliably PRODUCES A GRAPH TRTEXEC REJECTS on a modern torch. The
+# vendored MobileSAM PromptEncoder does boolean-mask assignment
+# (point_embedding[labels == -1] = 0.0, in prompt_encoder.py), and torch's
+# TorchScript-based ONNX exporter traces that differently depending on torch
+# version: 2.4.1 emits Where/Equal/Not (fine); 2.8.0 emits a OneHot feeding
+# into Tile's shape input, which trtexec rejects outright:
+#   Error Code 4: Internal Error (/OneHot: an IIOneHotLayer cannot be used
+#   to compute a shape tensor)
+# This is a known, still-open upstream issue (NVIDIA-AI-IOT/nanosam#16) with
+# no fix from either project -- NVIDIA's own jetson-containers build sidesteps
+# it exactly this way, fetching a pre-exported ONNX instead of exporting on
+# whatever torch happens to be installed. Confirmed the mirror's copy has no
+# OneHot node and matches the exact input/output names
+# (image_embeddings/point_coords/point_labels/mask_input/has_mask_input ->
+# iou_predictions/low_res_masks) nanosam's own Predictor expects.
+#
+# mobile_sam_mask_decoder.onnx sha256, for anyone who wants to check it:
+#   3bcf84c17762173110783980ccdb8c97d2fd463dc62091dbcd667682bd297de3
+DECODER_ONNX_MIRROR="https://raw.githubusercontent.com/johnnynunez/nanosam/main/data/mobile_sam_mask_decoder.onnx"
+
+# Set to export fresh instead -- e.g. to target a different checkpoint or
+# model-type, or once the upstream OneHot issue is eventually fixed. Needs
+# nanosam (--no-deps) and timm (--no-deps; declares torch/torchvision as
+# hard deps, so DON'T drop --no-deps for it) -- neither is needed on the
+# default, pre-built path, since Predictor only ever loads compiled engines.
+NANOSAM_EXPORT_DECODER="${NANOSAM_EXPORT_DECODER:-0}"
+
 if [[ -f "$DATA_DIR/mobile_sam_mask_decoder.engine" ]]; then
   log "NanoSAM decoder engine already present, skipping"
 else
   if [[ ! -f "$DATA_DIR/mobile_sam_mask_decoder.onnx" ]]; then
-    # This one is produced with nanosam's own export script rather than
-    # fetched pre-built, so nothing here depends on a third-party mirror:
-    # only the mobile_sam.pt checkpoint, which ships in the nanosam repo
-    # itself (assets/mobile_sam.pt).
-    if [[ ! -f "$DATA_DIR/mobile_sam.pt" ]]; then
-      log "Fetching MobileSAM checkpoint"
-      curl -fL --retry 4 --retry-delay 2 \
-        -o "$DATA_DIR/mobile_sam.pt" \
-        "https://raw.githubusercontent.com/NVIDIA-AI-IOT/nanosam/main/assets/mobile_sam.pt"
-    fi
-    require_importable nanosam \
-      "./scripts/setup_jetson.sh          # installs it along with the other model repos
+    if [[ "$NANOSAM_EXPORT_DECODER" == "1" ]]; then
+      if [[ ! -f "$DATA_DIR/mobile_sam.pt" ]]; then
+        log "Fetching MobileSAM checkpoint"
+        curl -fL --retry 4 --retry-delay 2 \
+          -o "$DATA_DIR/mobile_sam.pt" \
+          "https://raw.githubusercontent.com/NVIDIA-AI-IOT/nanosam/main/assets/mobile_sam.pt"
+      fi
+      require_importable nanosam \
+        "./scripts/setup_jetson.sh          # installs it along with the other model repos
 or by hand:
     git clone https://github.com/NVIDIA-AI-IOT/nanosam
     pip install ./nanosam --no-deps"
 
-    # nanosam itself being installed doesn't mean its vendored MobileSAM does
-    # -- mobile_sam/modeling/tiny_vit_sam.py imports timm, which nanosam
-    # doesn't declare (installed with --no-deps, like the rest). Checked
-    # here, not left to the doctor preflight alone, for the same reason as
-    # the onnx check above: that preflight can be waved past, and this way
-    # the failure is instant instead of after the checkpoint download.
-    if ! "$PYTHON" -c 'from nanosam.mobile_sam import sam_model_registry' >/dev/null 2>&1; then
-      cat <<'EOF' >&2
+      # nanosam itself being installed doesn't mean its vendored MobileSAM
+      # does -- mobile_sam/modeling/tiny_vit_sam.py imports timm, which
+      # nanosam doesn't declare (installed with --no-deps, like the rest).
+      if ! "$PYTHON" -c 'from nanosam.mobile_sam import sam_model_registry' >/dev/null 2>&1; then
+        cat <<'EOF' >&2
 
 timm is not installed, and nanosam's vendored MobileSAM needs it
 (mobile_sam/modeling/tiny_vit_sam.py imports timm.models.layers).
@@ -186,14 +210,28 @@ safetensors) are already installed via the transformers step, so nothing
 is lost by skipping them.
 
 EOF
-      exit 1
-    fi
+        exit 1
+      fi
 
-    log "Exporting NanoSAM mask decoder to ONNX"
-    "$PYTHON" -m nanosam.tools.export_sam_mask_decoder_onnx \
-      --checkpoint="$DATA_DIR/mobile_sam.pt" \
-      --model-type=vit_t \
-      --output="$DATA_DIR/mobile_sam_mask_decoder.onnx"
+      log "Exporting NanoSAM mask decoder to ONNX (NANOSAM_EXPORT_DECODER=1)"
+      echo "Note: this reliably produces a graph trtexec rejects on torch >= ~2.5" \
+           "-- see the comment above this block. Unset NANOSAM_EXPORT_DECODER to" \
+           "use the known-working pre-built ONNX instead."
+      "$PYTHON" -m nanosam.tools.export_sam_mask_decoder_onnx \
+        --checkpoint="$DATA_DIR/mobile_sam.pt" \
+        --model-type=vit_t \
+        --output="$DATA_DIR/mobile_sam_mask_decoder.onnx"
+    else
+      log "Fetching mobile_sam_mask_decoder.onnx (pre-built, avoids a known trtexec/OneHot failure)"
+      if ! curl -fL --retry 4 --retry-delay 2 \
+          -o "$DATA_DIR/mobile_sam_mask_decoder.onnx" "$DECODER_ONNX_MIRROR"; then
+        rm -f "$DATA_DIR/mobile_sam_mask_decoder.onnx"
+        echo "Mirror fetch failed. Set NANOSAM_EXPORT_DECODER=1 to export fresh instead"
+        echo "(see the comment above this block for why that may fail on a modern torch),"
+        echo "or download by hand and save to $DATA_DIR/mobile_sam_mask_decoder.onnx"
+        exit 1
+      fi
+    fi
   fi
   log "Building NanoSAM mask decoder engine"
   trtexec \

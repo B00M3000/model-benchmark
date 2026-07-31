@@ -591,13 +591,20 @@ def install_timm() -> bool:
 def check_nanosam_runtime() -> None:
     """NanoSAM's vendored MobileSAM imports timm, but nothing installs it.
 
+    This is optional, not required: build_engines.sh fetches a pre-built
+    mobile_sam_mask_decoder.onnx by default (exporting it fresh reliably
+    produces a graph trtexec rejects on a modern torch -- see the comment in
+    build_engines.sh), and nanosam.utils.predictor.Predictor -- the actual
+    runtime class this app uses -- only ever loads compiled engines, never
+    nanosam.mobile_sam. timm is only needed if you set
+    NANOSAM_EXPORT_DECODER=1 to export fresh instead.
+
     nanosam/mobile_sam/modeling/tiny_vit_sam.py does
     `from timm.models.layers import DropPath` -- reached from
-    `nanosam.mobile_sam.sam_model_registry`, which the mask-decoder ONNX
-    export script imports at its very first line. nanosam's own setup.py
-    declares no dependencies (like nanoowl, and for the same reason: it must
-    be installed with --no-deps so pip can't replace JetPack's torch), so
-    nothing pulls timm in.
+    `nanosam.mobile_sam.sam_model_registry`, which the export script imports
+    at its very first line. nanosam's own setup.py declares no dependencies
+    (like nanoowl, and for the same reason: it must be installed with
+    --no-deps so pip can't replace JetPack's torch), so nothing pulls timm in.
 
     Unlike transformers and onnx, timm's own pyproject.toml lists torch and
     torchvision as hard, unconstrained dependencies -- so timm gets --no-deps
@@ -614,14 +621,15 @@ def check_nanosam_runtime() -> None:
     if module_status("nanosam")[0] != "ok":
         return
 
-    section("NanoSAM runtime (timm)")
+    section("NanoSAM runtime (timm, optional -- only for NANOSAM_EXPORT_DECODER=1)")
     try:
         from nanosam.mobile_sam import sam_model_registry  # noqa: F401
     except ModuleNotFoundError as exc:
-        bad(
+        warn(
             f"{exc.name} not importable",
-            "needed by nanosam's vendored MobileSAM "
-            "(mobile_sam/modeling/tiny_vit_sam.py)",
+            "only needed if exporting the mask decoder fresh "
+            "(NANOSAM_EXPORT_DECODER=1) -- the default build_engines.sh path "
+            "uses a pre-built ONNX and never touches nanosam.mobile_sam",
             "pip install timm --no-deps      # --no-deps: timm declares "
             "torch/torchvision as hard dependencies; see the comment on "
             "check_nanosam_runtime",
@@ -629,13 +637,108 @@ def check_nanosam_runtime() -> None:
         )
         return
     except ImportError as exc:
-        bad(
+        warn(
             "nanosam.mobile_sam import failed",
             str(exc).splitlines()[0],
             fix_action=install_timm,
         )
         return
     ok("timm", "nanosam.mobile_sam.sam_model_registry importable")
+
+
+def install_segment_anything() -> bool:
+    # Not on PyPI under a trustworthy name; installed from source, same as
+    # torch2trt. No --no-deps needed: its own setup.py declares zero deps.
+    return run_fix(
+        "install segment_anything (efficientvit's SAM predictor needs it)",
+        [sys.executable, "-m", "pip", "install",
+         "git+https://github.com/facebookresearch/segment-anything.git"],
+    )
+
+
+def install_triton() -> bool:
+    # No --no-deps: triton's only unconstrained dependency is
+    # importlib-metadata, and only for Python < 3.10.
+    return run_fix(
+        "install triton (efficientvit.models.nn imports it unconditionally)",
+        [sys.executable, "-m", "pip", "install", "triton"],
+    )
+
+
+def check_efficientvit_runtime() -> None:
+    """EfficientViT-SAM's own predictor needs two packages nothing installs.
+
+    Traced the full import graph from efficientvit.models.efficientvit.sam
+    and efficientvit.sam_model_zoo (the two entry points this app's
+    EfficientViTSamSegmenter actually uses) with a static analyzer rather
+    than guessing, after transformers/onnx/timm each turned out to be one
+    crash at a time. Two real gaps, found that way:
+
+    - `from segment_anything import SamAutomaticMaskGenerator` (sam.py).
+      Meta's original SAM. efficientvit's own setup.py even declares this,
+      as a git dependency -- but efficientvit is installed with --no-deps
+      (required, same reason as the other three repos), so nothing pulls it
+      in. Its own setup.py declares zero dependencies, so no --no-deps
+      concern installing it.
+
+    - `import triton` (models/nn/triton_rms_norm.py). Reached unconditionally:
+      models/nn/__init__.py does `from .norm import *`, and norm.py
+      unconditionally imports TritonRMSNorm2dFunc from triton_rms_norm.py --
+      so importing efficientvit.models.nn at all requires triton, even
+      though the L0 SAM variant this project uses never actually selects
+      triton-based normalization (sam_model_zoo.py builds it with
+      norm="bn2d"). Only the *import* has to succeed; the kernel itself is
+      never JIT-compiled or run for this model. triton publishes aarch64
+      manylinux wheels for cp310 (JetPack 6's Python), so this is a plain
+      pip install, not a build-from-source situation.
+
+    Skipped entirely if efficientvit itself isn't really installed --
+    check_models() already reports that.
+    """
+    from benchmark.models.registry import module_status
+
+    if module_status("efficientvit")[0] != "ok":
+        return
+
+    section("EfficientViT-SAM runtime (segment_anything, triton)")
+    try:
+        from segment_anything import SamAutomaticMaskGenerator  # noqa: F401
+    except ModuleNotFoundError as exc:
+        bad(
+            f"{exc.name} not importable",
+            "needed by efficientvit's own SAM predictor "
+            "(models/efficientvit/sam.py)",
+            "pip install git+https://github.com/facebookresearch/segment-anything.git",
+            fix_action=install_segment_anything,
+        )
+    except ImportError as exc:
+        bad(
+            "segment_anything import failed",
+            str(exc).splitlines()[0],
+            fix_action=install_segment_anything,
+        )
+    else:
+        ok("segment_anything", "SamAutomaticMaskGenerator importable")
+
+    try:
+        from efficientvit.models.nn.triton_rms_norm import TritonRMSNorm2dFunc  # noqa: F401
+    except ModuleNotFoundError as exc:
+        bad(
+            f"{exc.name} not importable",
+            "efficientvit.models.nn imports it unconditionally "
+            "(models/nn/norm.py), even though the L0 SAM variant never "
+            "actually uses triton-based normalization",
+            "pip install triton",
+            fix_action=install_triton,
+        )
+    except ImportError as exc:
+        bad(
+            "efficientvit.models.nn import failed",
+            str(exc).splitlines()[0],
+            fix_action=install_triton,
+        )
+    else:
+        ok("triton", "efficientvit.models.nn importable")
 
 
 def install_onnx() -> bool:
@@ -844,6 +947,7 @@ CHECKS = (
     check_models,
     check_nanoowl_runtime,
     check_nanosam_runtime,
+    check_efficientvit_runtime,
     check_torch2trt,
     check_onnx_export,
     check_artifacts,

@@ -198,9 +198,46 @@ def module_status(module: str) -> tuple[str, str]:
     if spec is None:
         return "missing", ""
     if spec.origin is None:
+        # Namespace package -- but that alone doesn't mean "shadowed". NanoSAM
+        # itself ships with no top-level __init__.py (only its submodules,
+        # e.g. nanosam/tools/__init__.py, have one), so a *correctly*
+        # configured repo_paths entry -- pointed at the clone root -- also
+        # resolves this way, and works fine. A broken shadow (sys.path
+        # pointed one level too high, at the clone root's parent) resolves
+        # as a namespace package too, but has nothing real one level in --
+        # the actual content is a further level deeper still. Tell them
+        # apart by checking for real content rather than trusting origin
+        # alone.
         locations = list(getattr(spec, "submodule_search_locations", None) or [])
+        if _namespace_has_real_content(locations):
+            return "ok", locations[0] if locations else ""
         return "shadowed", locations[0] if locations else ""
     return "ok", spec.origin
+
+
+def _namespace_has_real_content(locations: list[str]) -> bool:
+    """True if any of a namespace package's search locations directly
+    contains a real subpackage, as opposed to an empty clone-root directory
+    whose real content lives one level deeper still.
+
+    Deliberately does NOT count loose .py files as evidence: a git clone
+    root's own setup.py would otherwise look exactly like real content --
+    the actual clone root at sys.path's parent (the broken shadow case) has
+    one of those sitting right next to the real, further-nested package, so
+    trusting any .py file here produced a false "ok" for that broken case
+    during development. Only a subdirectory that is itself a proper package
+    (has __init__.py) counts -- that's what every one of nanosam's genuine
+    submodules is, and what a bare setup.py is not.
+    """
+    for location in locations:
+        try:
+            entries = os.listdir(location)
+        except OSError:
+            continue
+        for entry in entries:
+            if os.path.isfile(os.path.join(location, entry, "__init__.py")):
+                return True
+    return False
 
 
 def missing_jetson_modules(config: AppConfig | None = None) -> list[str]:

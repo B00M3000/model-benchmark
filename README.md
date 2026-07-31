@@ -138,12 +138,13 @@ git clone https://github.com/NVIDIA-AI-IOT/torch2trt
 .venv/bin/pip install -e efficientvit --no-deps
 .venv/bin/pip install    ./torch2trt  --no-deps --no-build-isolation
 
-# Neither of these gets --no-deps: see below.
+# None of these four get --no-deps: see below.
 .venv/bin/pip install transformers
 .venv/bin/pip install onnx
+.venv/bin/pip install "git+https://github.com/facebookresearch/segment-anything.git"
+.venv/bin/pip install triton
 
-# This one DOES get --no-deps -- see below.
-.venv/bin/pip install timm --no-deps
+# timm is NOT installed by default -- see below.
 ```
 
 **`torch2trt` is easy to miss.** It is not on PyPI and neither NanoOWL nor
@@ -175,29 +176,55 @@ says to run. Its only unconstrained core dependency is `numpy>=1.17`, already
 satisfied by the pinned `numpy<2` install, so pip leaves it alone rather than
 upgrading it.
 
-**`onnx` is the other exception, needed only for *building* engines, not for
-running a benchmark.** Both NanoOWL's `build_image_encoder_engine()` and
-NanoSAM's `export_sam_mask_decoder_onnx.py` call `torch.onnx.export()` to
+**`onnx` is needed only for *building* NanoOWL's engine, not for running a
+benchmark.** `build_image_encoder_engine()` calls `torch.onnx.export()` to
 produce the `.onnx` file `trtexec` then compiles, and PyTorch's ONNX exporter
-needs the `onnx` package itself to serialize the result. Neither repo declares
-it, so it's easy to burn several minutes tracing the NanoOWL model only to
+needs the `onnx` package itself to serialize the result. NanoOWL doesn't
+declare it, so it's easy to burn several minutes tracing the model only to
 fail on the last line with `torch.onnx.OnnxExporterError: Module onnx is not
 installed!`. Same reasoning as `transformers`: `onnx` doesn't depend on
 `torch`, and its `numpy>=1.23.2` is already satisfied, so a plain
 `pip install onnx` is safe and complete.
 
-**`timm` is the odd one out — it needs `--no-deps`, the opposite of the two
-above.** NanoSAM vendors MobileSAM, and
-`mobile_sam/modeling/tiny_vit_sam.py` imports `timm.models.layers`, reached
-the moment the mask-decoder ONNX export script runs. nanosam's own
-`setup.py` declares no dependencies (same reason as nanoowl — it must be
-installed with `--no-deps` too), so nothing pulls `timm` in. But unlike
-`transformers`/`onnx`, `timm`'s `pyproject.toml` lists `torch` **and**
-`torchvision` as hard, unconstrained dependencies — installing it without
-`--no-deps` risks the exact "PyPI wheel replaces JetPack's build" failure all
-of this is trying to avoid. `timm`'s three other dependencies (`pyyaml`,
-`huggingface_hub`, `safetensors`) are already satisfied by the `transformers`
-install above, so `--no-deps` doesn't actually skip anything real here.
+**`segment_anything` is Meta's original SAM, and EfficientViT-SAM's own
+predictor needs it directly.** `efficientvit/models/efficientvit/sam.py` does
+`from segment_anything import SamAutomaticMaskGenerator` — efficientvit's own
+`setup.py` even declares this, as a git dependency, but that's exactly what
+`--no-deps` (required for efficientvit itself) skips. It isn't on PyPI under
+a name worth trusting, so install it from the source repo, the same way as
+`torch2trt`. Its own `setup.py` declares zero dependencies, so there's
+nothing for `--no-deps` to protect against here either.
+
+**`triton` is not obviously related to any of this, but gets imported anyway.**
+`efficientvit/models/nn/__init__.py` unconditionally does `from .norm import
+*`, and `norm.py` unconditionally imports `TritonRMSNorm2dFunc` from
+`triton_rms_norm.py` — so importing `efficientvit.models.nn` at all requires
+`triton` to be installed, even though the L0 SAM variant this project uses
+never actually selects triton-based normalization (`sam_model_zoo.py` builds
+it with `norm="bn2d"`). Only the *import* has to succeed; the kernel is never
+JIT-compiled or run. `triton` publishes aarch64 wheels for JetPack 6's Python
+(3.10), so this is a plain `pip install triton`, not a build-from-source
+situation, and it declares no dependencies that would conflict with anything
+here.
+
+**`timm` is *not* installed by default**, unlike the four above. NanoSAM
+vendors MobileSAM, and `mobile_sam/modeling/tiny_vit_sam.py` imports
+`timm.models.layers` — but only `nanosam.tools.export_sam_mask_decoder_onnx`
+(the mask-decoder ONNX *export* script) ever reaches that import.
+`nanosam.utils.predictor.Predictor` — the class this app actually uses at
+runtime — only ever loads compiled TensorRT engines, and never touches
+`nanosam.mobile_sam` at all. Since `build_engines.sh` fetches a pre-built
+mask-decoder ONNX by default (see the `NANOSAM_EXPORT_DECODER` note in
+Troubleshooting below), `timm` is never needed in the default flow. If you do
+set `NANOSAM_EXPORT_DECODER=1`, install it with `--no-deps` — unlike
+`transformers`/`onnx`/`segment_anything`/`triton`, `timm`'s `pyproject.toml`
+lists `torch` **and** `torchvision` as hard, unconstrained dependencies, and
+its other three dependencies (`pyyaml`, `huggingface_hub`, `safetensors`) are
+already satisfied by the `transformers` install above:
+
+```bash
+.venv/bin/pip install timm --no-deps
+```
 
 Check the environment at any point:
 
@@ -207,8 +234,11 @@ Check the environment at any point:
 
 It verifies torch matches the driver's CUDA version and can convert NumPy
 arrays, that TensorRT and `trtexec` are present, that all four packages import,
-that torch2trt's `TRTModule` is new enough for the installed TensorRT, which
-weights and engines exist, and whether the clocks are pinned — each with the fix.
+that each repo's own runtime dependencies (`transformers`, `onnx`,
+`segment_anything`, `triton`) are actually reachable — not just the repo
+itself — that torch2trt's `TRTModule` is new enough for the installed
+TensorRT, which weights and engines exist, and whether the clocks are pinned
+— each with the fix.
 
 Build the TensorRT engines and fetch weights (once, on the Orin — engines are
 tied to the exact TensorRT version and GPU that built them and cannot be copied
@@ -323,6 +353,56 @@ them as missing afterward even though only this one thing was actually
 blocking anything. Re-running the script after installing `onnx` lets every
 step after the first one finally run.
 
+### "Error Code 4: Internal Error (/OneHot: an IIOneHotLayer cannot be used to compute a shape tensor)"
+
+```
+[TRT] ModelImporter.cpp:948: While parsing node number 146 [Tile -> "/Tile_output_0"]:
+...
+ITensor::getDimensions: Error Code 4: Internal Error (/OneHot: an IIOneHotLayer
+cannot be used to compute a shape tensor)
+[E] Failed to parse onnx file
+```
+
+...while building `mobile_sam_mask_decoder.engine`. This is **not** a missing
+package — this is TensorRT rejecting the ONNX graph itself. This is a known,
+still-open issue upstream ([NVIDIA-AI-IOT/nanosam#16](https://github.com/NVIDIA-AI-IOT/nanosam/issues/16)),
+not anything specific to this project's setup.
+
+**Root cause:** MobileSAM's `PromptEncoder._embed_points` does boolean-mask
+assignment (`point_embedding[labels == -1] = 0.0`, in
+`mobile_sam/modeling/prompt_encoder.py`). PyTorch's TorchScript-based ONNX
+exporter traces that differently depending on torch version: torch 2.4.1
+emits `Where`/`Equal`/`Not` (TensorRT parses this fine); torch 2.8.0 emits a
+`OneHot` op feeding into `Tile`'s shape input, which TensorRT explicitly
+refuses to use as a shape tensor. Same source code, different torch, different
+(and for newer torch, broken) graph.
+
+**Fix:** `build_engines.sh` no longer exports this ONNX file fresh by
+default — it fetches a pre-built one instead, confirmed to contain no
+`OneHot` node and to match the exact input/output names
+(`image_embeddings`/`point_coords`/`point_labels`/`mask_input`/`has_mask_input`
+→ `iou_predictions`/`low_res_masks`) `nanosam.utils.predictor.Predictor`
+expects. If you already have a broken `data/mobile_sam_mask_decoder.onnx`
+from an earlier run, delete it and re-run the script:
+
+```bash
+rm -f data/mobile_sam_mask_decoder.onnx data/mobile_sam_mask_decoder.engine
+./scripts/build_engines.sh
+```
+
+If you specifically need a fresh export (a different checkpoint or
+model-type, or once the upstream issue is eventually fixed), set
+`NANOSAM_EXPORT_DECODER=1` — this is the one case where you'll actually need
+`timm` (see below), since only the export script touches
+`nanosam.mobile_sam` at all:
+
+```bash
+NANOSAM_EXPORT_DECODER=1 ./scripts/build_engines.sh
+```
+
+Expect this to reproduce the same TensorRT error on a modern torch, unless
+you also pin an older torch just for the export step.
+
 ### "No module named 'timm'"
 
 ```
@@ -331,23 +411,73 @@ File ".../nanosam/mobile_sam/modeling/tiny_vit_sam.py", line 15, in <module>
 ModuleNotFoundError: No module named 'timm'
 ```
 
-NanoSAM vendors MobileSAM, and its TinyViT image encoder imports `timm` --
-reached the moment `nanosam.mobile_sam.sam_model_registry` is imported, which
-the mask-decoder ONNX export script does on its very first line. nanosam
-itself declares no dependencies (installed with `--no-deps`, like the other
-three repos), so nothing pulls `timm` in.
+This should only happen with `NANOSAM_EXPORT_DECODER=1` (see above) — the
+default `build_engines.sh` flow fetches a pre-built ONNX and never imports
+`nanosam.mobile_sam` at all. NanoSAM vendors MobileSAM, and its TinyViT image
+encoder imports `timm` — reached the moment
+`nanosam.mobile_sam.sam_model_registry` is imported, which the export script
+does on its very first line. nanosam itself declares no dependencies
+(installed with `--no-deps`, like the other three repos), so nothing pulls
+`timm` in.
 
 ```bash
 .venv/bin/pip install timm --no-deps
 ```
 
-**This one keeps `--no-deps`, unlike `transformers`/`onnx` above.** `timm`'s
-`pyproject.toml` lists `torch` and `torchvision` as hard, unconstrained
-dependencies, so installing it without `--no-deps` risks pip replacing
-JetPack's build — the exact failure the rest of this guide exists to prevent.
-`timm`'s other three dependencies (`pyyaml`, `huggingface_hub`,
-`safetensors`) are already satisfied once `transformers` is installed, so
-nothing real is lost by skipping them.
+**This one keeps `--no-deps`, unlike `transformers`/`onnx`/`segment_anything`/
+`triton`.** `timm`'s `pyproject.toml` lists `torch` and `torchvision` as
+hard, unconstrained dependencies, so installing it without `--no-deps` risks
+pip replacing JetPack's build — the exact failure the rest of this guide
+exists to prevent. `timm`'s other three dependencies (`pyyaml`,
+`huggingface_hub`, `safetensors`) are already satisfied once `transformers`
+is installed, so nothing real is lost by skipping them.
+
+### "No module named 'segment_anything'"
+
+```
+File ".../efficientvit/models/efficientvit/sam.py", line 9, in <module>
+    from segment_anything import SamAutomaticMaskGenerator
+ModuleNotFoundError: No module named 'segment_anything'
+```
+
+EfficientViT-SAM's own predictor imports Meta's original SAM directly.
+efficientvit's `setup.py` even declares this — as a git dependency — but
+that's exactly what `--no-deps` (required for efficientvit itself) skips.
+
+```bash
+.venv/bin/pip install "git+https://github.com/facebookresearch/segment-anything.git"
+```
+
+Not `--no-deps` — `segment_anything`'s own `setup.py` declares zero
+dependencies, so there's nothing here to protect against. It isn't installed
+from PyPI because there's no way to confirm a PyPI package under that name is
+actually Meta's; installing from the source repo (the same approach used for
+`torch2trt`) avoids that ambiguity entirely.
+
+### "No module named 'triton'"
+
+```
+File ".../efficientvit/models/nn/triton_rms_norm.py", line 2, in <module>
+    import triton
+ModuleNotFoundError: No module named 'triton'
+```
+
+Surprising, since nothing in an EfficientViT-SAM-L0 run actually asks for
+triton-based normalization — but `efficientvit/models/nn/__init__.py`
+unconditionally does `from .norm import *`, and `norm.py` unconditionally
+imports `TritonRMSNorm2dFunc` from `triton_rms_norm.py`. So importing
+`efficientvit.models.nn` at all requires `triton` to be installed, even
+though `sam_model_zoo.py` builds the L0 model with `norm="bn2d"` and the
+triton kernel is never actually JIT-compiled or run.
+
+```bash
+.venv/bin/pip install triton
+```
+
+Not `--no-deps` — `triton`'s only unconstrained dependency is
+`importlib-metadata`, and only for Python older than 3.10 (JetPack 6 ships
+3.10). `triton` publishes aarch64 `manylinux` wheels for cp310, so this is a
+plain, fast wheel install, not a build from source.
 
 ### "No module named 'nanosam.tools'" (or any `<pkg>.<submodule>` after a supposedly clean install)
 

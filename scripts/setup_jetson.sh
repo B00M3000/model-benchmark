@@ -133,26 +133,52 @@ else
 fi
 
 # onnx is not one of the four repos either -- it's what torch.onnx.export()
-# needs to serialize a model, and both NanoOWL's and NanoSAM's engine builds
-# call it. Not --no-deps: onnx doesn't depend on torch, so there's nothing
-# here for --no-deps to protect against.
-log "onnx (needed to build the NanoOWL and NanoSAM engines)"
+# needs to serialize a model, and NanoOWL's engine build calls it. Not
+# --no-deps: onnx doesn't depend on torch, so there's nothing here for
+# --no-deps to protect against.
+#
+# NanoSAM's mask decoder does NOT need this: build_engines.sh fetches a
+# pre-built ONNX for it by default rather than exporting fresh, since a fresh
+# export reliably produces a graph trtexec rejects on a modern torch (see
+# the comment in build_engines.sh). timm -- needed only by that export path,
+# via nanosam's vendored MobileSAM -- is deliberately not installed here for
+# the same reason; install it by hand (pip install timm --no-deps) only if
+# you set NANOSAM_EXPORT_DECODER=1.
+log "onnx (needed to build the NanoOWL engine)"
 if "$PYTHON" -c 'import onnx' >/dev/null 2>&1; then
   ok "already importable"
 else
   "$PYTHON" -m pip install onnx
 fi
 
-# timm, unlike transformers/onnx, DOES get --no-deps: its pyproject.toml
-# declares torch and torchvision as hard dependencies, so a plain install
-# risks replacing JetPack's build. Its other dependencies (pyyaml,
-# huggingface_hub, safetensors) are already covered by the transformers
-# install above.
-log "timm (nanosam's vendored MobileSAM needs it)"
-if "$PYTHON" -c 'from nanosam.mobile_sam import sam_model_registry' >/dev/null 2>&1; then
+# segment_anything is Meta's original SAM, not one of the four repos, but
+# efficientvit's own SAM predictor (models/efficientvit/sam.py) imports it
+# directly -- efficientvit's setup.py even declares it, as a git dependency,
+# which --no-deps (needed for efficientvit itself) skips. Not on PyPI under
+# a trustworthy name; installed from the source repo, same as torch2trt.
+# No --no-deps needed: its own setup.py declares zero dependencies.
+log "segment_anything (efficientvit's SAM predictor needs it)"
+if "$PYTHON" -c 'from segment_anything import SamAutomaticMaskGenerator' >/dev/null 2>&1; then
   ok "already importable"
 else
-  "$PYTHON" -m pip install timm --no-deps
+  "$PYTHON" -m pip install "git+https://github.com/facebookresearch/segment-anything.git"
+fi
+
+# triton is OpenAI's GPU kernel compiler. Not obviously related to any of
+# this, but efficientvit.models.nn/__init__.py unconditionally does
+# `from .norm import *`, and norm.py unconditionally imports
+# TritonRMSNorm2dFunc from triton_rms_norm.py -- so importing
+# efficientvit.models.nn AT ALL requires triton, even though the L0 SAM
+# variant this project uses never actually selects triton-based
+# normalization (it uses plain batchnorm; norm="bn2d" in sam_model_zoo.py).
+# Only the import has to succeed, the kernel is never JIT-compiled or run.
+# No --no-deps needed: triton's only unconstrained dependency is
+# importlib-metadata, and only for Python < 3.10.
+log "triton (efficientvit.models.nn imports it unconditionally)"
+if "$PYTHON" -c 'import triton' >/dev/null 2>&1; then
+  ok "already importable"
+else
+  "$PYTHON" -m pip install triton
 fi
 
 log "Verifying"
