@@ -138,8 +138,9 @@ git clone https://github.com/NVIDIA-AI-IOT/torch2trt
 .venv/bin/pip install -e efficientvit --no-deps
 .venv/bin/pip install    ./torch2trt  --no-deps --no-build-isolation
 
-# NOT --no-deps: see below.
+# Neither of these gets --no-deps: see below.
 .venv/bin/pip install transformers
+.venv/bin/pip install onnx
 ```
 
 **`torch2trt` is easy to miss.** It is not on PyPI and neither NanoOWL nor
@@ -170,6 +171,17 @@ this is also exactly what [NanoOWL's own README](https://github.com/NVIDIA-AI-IO
 says to run. Its only unconstrained core dependency is `numpy>=1.17`, already
 satisfied by the pinned `numpy<2` install, so pip leaves it alone rather than
 upgrading it.
+
+**`onnx` is the other exception, needed only for *building* engines, not for
+running a benchmark.** Both NanoOWL's `build_image_encoder_engine()` and
+NanoSAM's `export_sam_mask_decoder_onnx.py` call `torch.onnx.export()` to
+produce the `.onnx` file `trtexec` then compiles, and PyTorch's ONNX exporter
+needs the `onnx` package itself to serialize the result. Neither repo declares
+it, so it's easy to burn several minutes tracing the NanoOWL model only to
+fail on the last line with `torch.onnx.OnnxExporterError: Module onnx is not
+installed!`. Same reasoning as `transformers`: `onnx` doesn't depend on
+`torch`, and its `numpy>=1.23.2` is already satisfied, so a plain
+`pip install onnx` is safe and complete.
 
 Check the environment at any point:
 
@@ -261,6 +273,39 @@ pinned `numpy<2` install, so pip leaves it in place rather than upgrading it.
 `scripts/doctor.py` checks this by attempting the exact import NanoOWL
 performs, so it names whichever link in the chain is actually missing rather
 than guessing.
+
+### "Module onnx is not installed!" (during an engine build)
+
+```
+File ".../nanoowl/owl_predictor.py", line 370, in export_image_encoder_onnx
+    torch.onnx.export(
+  ...
+torch.onnx.OnnxExporterError: Module onnx is not installed!
+```
+
+Both NanoOWL's and NanoSAM's engine builds export to ONNX via
+`torch.onnx.export()` before `trtexec` compiles the result, and PyTorch's
+exporter needs the `onnx` package itself to serialize that output. Neither
+repo declares it as a dependency, so a `--no-deps` install lacks it — and
+because this only fails at the very end of `export_image_encoder_onnx()`,
+you'll see several minutes of tracing output first (`Loading weights...`,
+the `torch.meshgrid` warning, `TracerWarning`) before hitting this.
+
+```bash
+.venv/bin/pip install onnx
+```
+
+Not `--no-deps` — `onnx` doesn't depend on `torch` (only `numpy>=1.23.2`,
+already satisfied by the pinned `numpy<2` install), so there's nothing here
+for `--no-deps` to protect against.
+
+If this happened via `./scripts/build_engines.sh`, note that the script has
+`set -euo pipefail`: the moment the *first* step (NanoOWL's engine) fails,
+the script stops immediately, so NanoSAM's engine and the EfficientViT
+weights never get their turn either — `doctor.py` will still list all of
+them as missing afterward even though only this one thing was actually
+blocking anything. Re-running the script after installing `onnx` lets every
+step after the first one finally run.
 
 ### "No module named 'nanosam.tools'" (or any `<pkg>.<submodule>` after a supposedly clean install)
 

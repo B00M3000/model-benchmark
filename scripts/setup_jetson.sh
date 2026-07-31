@@ -132,5 +132,16 @@ else
   "$PYTHON" -m pip install transformers
 fi
 
+# onnx is not one of the four repos either -- it's what torch.onnx.export()
+# needs to serialize a model, and both NanoOWL's and NanoSAM's engine builds
+# call it. Not --no-deps: onnx doesn't depend on torch, so there's nothing
+# here for --no-deps to protect against.
+log "onnx (needed to build the NanoOWL and NanoSAM engines)"
+if "$PYTHON" -c 'import onnx' >/dev/null 2>&1; then
+  ok "already importable"
+else
+  "$PYTHON" -m pip install onnx
+fi
+
 log "Verifying"
 "$PYTHON" scripts/doctor.py

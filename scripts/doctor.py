@@ -574,6 +574,44 @@ def check_nanoowl_runtime() -> None:
     ok("transformers", "OwlViTForObjectDetection importable")
 
 
+def install_onnx() -> bool:
+    # No --no-deps: onnx doesn't declare torch, so there's nothing here for
+    # --no-deps to protect against. Its numpy>=1.23.2 is already satisfied
+    # by the pinned numpy<2 install, so pip leaves it alone.
+    return run_fix(
+        "install onnx (needed to export engines to ONNX before building them)",
+        [sys.executable, "-m", "pip", "install", "onnx"],
+    )
+
+
+def check_onnx_export() -> None:
+    """Both engine builds go through torch.onnx.export, which needs `onnx`.
+
+    NanoOWL's build_image_encoder_engine() and NanoSAM's own
+    export_sam_mask_decoder_onnx.py both call torch.onnx.export() to produce
+    the .onnx file that trtexec then compiles. torch's ONNX exporter imports
+    the onnx package itself to serialize the result -- but neither NanoOWL
+    nor NanoSAM depends on it, so a clean --no-deps install lacks it. Unlike
+    the runtime NanoOWL check, this doesn't block actually running a
+    benchmark once engines exist; it only blocks *building* them, which is
+    why it's checked next to the artifacts rather than next to the models.
+    """
+    section("ONNX export tooling")
+    try:
+        import onnx  # noqa: F401
+    except ImportError:
+        bad(
+            "onnx not importable",
+            "needed by torch.onnx.export(), which both NanoOWL's and "
+            "NanoSAM's engine builds use to produce the .onnx file trtexec "
+            "compiles",
+            "pip install onnx      # not --no-deps; see check_onnx_export",
+            fix_action=install_onnx,
+        )
+        return
+    ok("onnx", getattr(onnx, "__version__", ""))
+
+
 def check_torch2trt() -> None:
     """torch2trt is what actually executes the .engine files.
 
@@ -742,6 +780,7 @@ CHECKS = (
     check_models,
     check_nanoowl_runtime,
     check_torch2trt,
+    check_onnx_export,
     check_artifacts,
     check_clocks,
 )

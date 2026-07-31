@@ -78,6 +78,28 @@ or by hand:
 (--no-build-isolation: its setup.py imports tensorrt/torch to compile a CUDA
 extension, and pip's isolated build env doesn't inherit --system-site-packages)"
 
+# Both the NanoOWL and NanoSAM engine builds export to ONNX via
+# torch.onnx.export(), which needs the onnx package itself to serialize the
+# result -- but neither repo declares it, so a --no-deps install lacks it.
+# Checked here, not just left to the doctor preflight above, because that
+# preflight can be waved past with "Continue anyway?", and without this the
+# failure only surfaces after several minutes of tracing the model.
+if ! "$PYTHON" -c 'import onnx' >/dev/null 2>&1; then
+  cat <<'EOF' >&2
+
+onnx is not installed, and both engine builds below need it.
+
+torch.onnx.export() (used by NanoOWL's build_image_encoder_engine and
+NanoSAM's export_sam_mask_decoder_onnx) needs the onnx package itself to
+serialize its output, but neither repo declares it as a dependency.
+
+    pip install onnx      # not --no-deps -- onnx doesn't depend on torch,
+                           # so there's nothing here for --no-deps to protect
+
+EOF
+  exit 1
+fi
+
 # ── NanoOWL: OWL-ViT image encoder ────────────────────────────────────────
 if [[ -f "$DATA_DIR/owl_image_encoder_patch32.engine" ]]; then
   log "NanoOWL engine already present, skipping"
