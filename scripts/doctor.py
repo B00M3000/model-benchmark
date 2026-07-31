@@ -13,11 +13,13 @@ Exit code 0 if the host can run a real benchmark, 1 otherwise.
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -28,24 +30,58 @@ GREEN, YELLOW, RED, DIM, BOLD, RESET = (
 
 _problems: list[str] = []
 _warnings: list[str] = []
+# (label, callable) for everything --fix knows how to repair. Populated as the
+# checks run, so a fix is only ever offered for a problem actually observed.
+_fixes: list[tuple[str, Callable[[], bool]]] = []
 
 
 def ok(label: str, detail: str = "") -> None:
     print(f"  {GREEN}✓{RESET} {label}" + (f"  {DIM}{detail}{RESET}" if detail else ""))
 
 
-def warn(label: str, detail: str = "", fix: str = "") -> None:
+def _record_fix(label: str, fix_action: Callable[[], bool] | None) -> None:
+    if fix_action is not None:
+        _fixes.append((label, fix_action))
+        print(f"    {DIM}--fix can repair this{RESET}")
+
+
+def warn(
+    label: str,
+    detail: str = "",
+    fix: str = "",
+    fix_action: Callable[[], bool] | None = None,
+) -> None:
     print(f"  {YELLOW}!{RESET} {label}" + (f"  {DIM}{detail}{RESET}" if detail else ""))
     if fix:
         print(f"    {DIM}{fix}{RESET}")
+    _record_fix(label, fix_action)
     _warnings.append(label)
 
 
-def bad(label: str, detail: str = "", fix: str = "") -> None:
+def bad(
+    label: str,
+    detail: str = "",
+    fix: str = "",
+    fix_action: Callable[[], bool] | None = None,
+) -> None:
     print(f"  {RED}✗{RESET} {label}" + (f"  {DIM}{detail}{RESET}" if detail else ""))
     if fix:
         print(f"    {DIM}{fix}{RESET}")
+    _record_fix(label, fix_action)
     _problems.append(label)
+
+
+def run_fix(what: str, args: list[str], use_sudo: bool = False) -> bool:
+    """Run one repair command, echoing it first so it is never a black box."""
+    if use_sudo and os.geteuid() != 0:
+        args = ["sudo"] + args
+    print(f"\n{BOLD}--> {what}{RESET}")
+    print(f"    {DIM}{' '.join(args)}{RESET}")
+    try:
+        return subprocess.run(args).returncode == 0
+    except Exception as exc:
+        print(f"    {RED}failed: {type(exc).__name__}: {exc}{RESET}")
+        return False
 
 
 def section(title: str) -> None:
@@ -132,12 +168,45 @@ def parse_cuda(text: str | None) -> tuple[int, int] | None:
         return None
 
 
+def jetson_wheel_index(driver: int | None) -> str:
+    """NVIDIA's wheel index matching the driver's CUDA version."""
+    cuda = f"cu{fmt_cuda(driver).replace('.', '')}" if driver else "cu126"
+    return f"https://pypi.jetson-ai-lab.dev/jp6/{cuda}"
+
+
 JETSON_TORCH_FIX = (
     "Install a Jetson-matched build instead, e.g. for JetPack 6.x / CUDA 12.6:\n    "
     "  pip install --no-cache-dir --index-url "
     "https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision\n    "
     "Then install the model repos with --no-deps so pip cannot replace it again."
 )
+
+
+def install_matched_torch(driver: int | None):
+    """Install a driver-matched torch/torchvision into the *venv*.
+
+    Deliberately into the venv rather than over the system copy: the venv takes
+    precedence over /usr/local/lib/.../dist-packages, so this shadows the bad
+    build without sudo and without touching anything JetPack owns. Undo by
+    deleting the venv.
+
+    torch and torchvision go in together, always -- installing one alone is
+    what produces "operator torchvision::nms does not exist".
+    """
+    if sys.prefix == sys.base_prefix:
+        return None  # would modify the system install; too blunt to automate
+
+    def run() -> bool:
+        return run_fix(
+            "install driver-matched torch + torchvision into the venv",
+            [
+                sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                "--index-url", jetson_wheel_index(driver),
+                "torch", "torchvision",
+            ],
+        )
+
+    return run
 
 
 def check_torch() -> None:
@@ -172,6 +241,11 @@ def check_torch() -> None:
     # This is the condition that actually produces "The NVIDIA driver on your
     # system is too old"; the wheel's filename or version suffix is not, since
     # working Jetson wheels are published without one.
+    #
+    # No fix_action here even though this is the real diagnosis: the
+    # torch.cuda.is_available() check right below is about to hit the same
+    # mismatch and offers the identical repair. Attaching it to both would
+    # queue the same pip install twice under --fix.
     built = parse_cuda(built_for)
     if built is not None and driver is not None and built > (
         driver // 1000,
@@ -196,13 +270,20 @@ def check_torch() -> None:
             )
         else:
             hint = message
-        bad("torch.cuda is unusable", message.splitlines()[0], hint)
+        bad(
+            "torch.cuda is unusable",
+            message.splitlines()[0],
+            hint,
+            fix_action=install_matched_torch(driver) if "too old" in message else None,
+        )
         return
 
     if not available:
         bad(
             "torch.cuda.is_available() is False",
-            fix="No usable GPU. On a Jetson this usually means a mismatched torch wheel.",
+            fix="No usable GPU. On a Jetson this usually means a mismatched torch "
+                "wheel.\n    " + JETSON_TORCH_FIX,
+            fix_action=install_matched_torch(driver),
         )
         return
 
@@ -372,24 +453,52 @@ def check_models() -> None:
     if added:
         ok("repo_paths", ", ".join(added))
 
-    import importlib.util
+    from benchmark.models.registry import module_status
 
     for required in REQUIRED_MODULES:
         if required.module in DETAILED_CHECKS:
             continue  # reported by its own section, in more detail
-        try:
-            spec = importlib.util.find_spec(required.module)
-        except (ImportError, ValueError):
-            spec = None
-        if spec is not None:
-            ok(required.module, spec.origin or "")
-        else:
-            bad(
-                required.module,
-                f"not importable — {required.why}",
-                f"{required.install_hint}\n    "
-                "(or add the clone to repo_paths in config.yaml)",
-            )
+        report_module(required, *module_status(required.module))
+
+
+def report_module(required, status: str, origin: str) -> None:
+    """Shared reporting for one required package."""
+    if status == "ok":
+        ok(required.module, origin)
+    elif status == "shadowed":
+        bad(
+            required.module,
+            f"not installed — {origin or 'the clone directory'} is shadowing it",
+            "The clone's root directory has the same name as the package inside "
+            "it,\n    so Python imports the empty root instead. Installing it "
+            "fixes the ordering:\n    "
+            f"  {required.install_hint}",
+            fix_action=install_module(required, origin),
+        )
+    else:
+        bad(
+            required.module,
+            f"not importable — {required.why}",
+            f"{required.install_hint}\n    "
+            "(or add the clone to repo_paths in config.yaml)",
+            fix_action=install_module(required, origin),
+        )
+
+
+def install_module(required, origin: str):
+    """A callable that pip-installs one required package, or None."""
+    clone = Path(origin) if origin else REPO_ROOT / required.module
+    if not (clone / "setup.py").exists() and not (clone / "pyproject.toml").exists():
+        return None
+
+    def run() -> bool:
+        args = [sys.executable, "-m", "pip", "install"]
+        if required.editable:
+            args.append("-e")
+        args += [str(clone), "--no-deps"]
+        return run_fix(f"install {required.module}", args)
+
+    return run
 
 
 def check_torch2trt() -> None:
@@ -401,21 +510,21 @@ def check_torch2trt() -> None:
     surfaces at the very end of the NanoOWL engine build.
     """
     section("torch2trt")
+    from benchmark.models.registry import MODULE_BY_NAME, module_status
+
+    required = MODULE_BY_NAME["torch2trt"]
+    status, origin = module_status("torch2trt")
+    if status != "ok":
+        report_module(required, status, origin)
+        return
+
     try:
         import torch2trt
-    except ImportError:
-        bad(
-            "torch2trt not importable",
-            "NanoOWL and NanoSAM both need it to run their TensorRT engines",
-            "git clone https://github.com/NVIDIA-AI-IOT/torch2trt\n    "
-            "pip install ./torch2trt --no-deps      # --no-deps: it pulls in tensorrt",
-        )
-        return
     except Exception as exc:
         bad("torch2trt failed to import", f"{type(exc).__name__}: {exc}")
         return
 
-    ok("torch2trt", getattr(torch2trt, "__file__", "") or "")
+    ok("torch2trt", getattr(torch2trt, "__file__", "") or origin)
 
     try:
         from torch2trt import TRTModule
@@ -425,6 +534,7 @@ def check_torch2trt() -> None:
             "installed torch2trt is too old or partially built",
             "Reinstall from master: pip install --force-reinstall --no-deps "
             "./torch2trt",
+            fix_action=install_module(required, origin),
         )
         return
 
@@ -475,9 +585,33 @@ def check_artifacts() -> None:
             size_mb = os.path.getsize(path) / (1 << 20)
             ok(label, f"{size_mb:.0f} MB")
         elif required:
-            bad(label, f"missing: {path}", "./scripts/build_engines.sh")
+            bad(
+                label,
+                f"missing: {path}",
+                "./scripts/build_engines.sh",
+                fix_action=build_artifacts,
+            )
         else:
             warn(label, "absent — EfficientViT-SAM will run via PyTorch instead")
+
+
+def build_artifacts() -> bool:
+    """Download the weights and build the engines, via the existing script.
+
+    SKIP_DOCTOR=1: this is already running from inside a doctor check, so the
+    script's own preflight would just re-run us -- and if an earlier fix in
+    this same --fix pass had failed, its interactive "Continue anyway? [y/N]"
+    prompt would block with no one watching stdin.
+    """
+    env = {**os.environ, "SKIP_DOCTOR": "1"}
+    print(f"\n{BOLD}--> fetch weights and build TensorRT engines{RESET}")
+    script = REPO_ROOT / "scripts" / "build_engines.sh"
+    print(f"    {DIM}bash {script}{RESET}")
+    try:
+        return subprocess.run(["bash", str(script)], env=env).returncode == 0
+    except Exception as exc:
+        print(f"    {RED}failed: {type(exc).__name__}: {exc}{RESET}")
+        return False
 
 
 def check_clocks() -> None:
@@ -509,36 +643,91 @@ def check_clocks() -> None:
     if lines and (lines[-1] == "0" or "MAXN" in out.upper()):
         ok("Power mode", mode)
     else:
+        def pin_clocks() -> bool:
+            # Both, in order: nvpmodel raises the power ceiling, jetson_clocks
+            # then pins the frequencies to it. Either alone leaves the clocks
+            # free to drift mid-run.
+            if not run_fix("set maximum power mode", [nvpmodel, "-m", "0"], use_sudo=True):
+                return False
+            clocks = which("jetson_clocks") or "/usr/bin/jetson_clocks"
+            return run_fix("pin clocks", [clocks], use_sudo=True)
+
         warn(
             "Power mode may not be maximum",
             mode,
             "sudo nvpmodel -m 0 && sudo jetson_clocks   "
             "(unpinned clocks are the usual cause of noisy Jetson numbers)",
+            fix_action=pin_clocks,
         )
 
 
-def main() -> int:
-    print(f"{BOLD}Ablation benchmark — environment check{RESET}")
-    for check in (
-        check_platform,
-        check_torch,
-        check_opencv,
-        check_tensorrt,
-        check_models,
-        check_torch2trt,
-        check_artifacts,
-        check_clocks,
-    ):
+CHECKS = (
+    check_platform,
+    check_torch,
+    check_opencv,
+    check_tensorrt,
+    check_models,
+    check_torch2trt,
+    check_artifacts,
+    check_clocks,
+)
+
+
+def run_checks() -> None:
+    for check in CHECKS:
         try:
             check()
         except Exception as exc:  # a broken check must not hide the others
             bad(f"{check.__name__} failed", f"{type(exc).__name__}: {exc}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--fix", action="store_true",
+        help="attempt each repairable problem, then re-check",
+    )
+    args = parser.parse_args()
+
+    print(f"{BOLD}Ablation benchmark — environment check{RESET}")
+    run_checks()
+
+    if args.fix and _fixes:
+        # Several problems can share one remedy -- four missing artifacts all
+        # point at the same build_engines.sh call. Dedupe by identity so it
+        # runs once instead of four times in a row.
+        seen: set[int] = set()
+        unique_fixes = []
+        for label, fix_action in _fixes:
+            if id(fix_action) in seen:
+                continue
+            seen.add(id(fix_action))
+            unique_fixes.append((label, fix_action))
+
+        print(f"\n{BOLD}{'='*60}{RESET}")
+        print(f"{BOLD}--fix: attempting {len(unique_fixes)} repair(s){RESET}")
+        applied = 0
+        for label, fix_action in unique_fixes:
+            if fix_action():
+                applied += 1
+            else:
+                print(f"    {RED}did not complete — see output above{RESET}")
+
+        print(f"\n{BOLD}{'='*60}{RESET}")
+        print(f"{BOLD}Re-checking after {applied}/{len(unique_fixes)} repair(s){RESET}")
+        _problems.clear()
+        _warnings.clear()
+        _fixes.clear()
+        run_checks()
 
     print()
     if _problems:
         print(f"{RED}{len(_problems)} problem(s) block a real benchmark:{RESET}")
         for problem in _problems:
             print(f"  · {problem}")
+        if _fixes and not args.fix:
+            print(f"\n{DIM}{len(_fixes)} of these can be attempted automatically: "
+                  f"python3 scripts/doctor.py --fix{RESET}")
         print(f"\n{DIM}The app still runs with mock backends until these are fixed.{RESET}")
         return 1
 

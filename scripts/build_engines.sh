@@ -76,14 +76,33 @@ else
 fi
 
 # ── NanoSAM: ResNet18 encoder + MobileSAM mask decoder ────────────────────
+#
+# Neither ONNX file ships in the nanosam repo -- the README points at a
+# Google Drive link for the encoder, which needs a confirm-token dance for
+# files this size and is unreachable from behind some proxies. NVIDIA's own
+# jetson-containers build hit the same problem and switched to a GitHub
+# mirror (github.com/johnnynunez/nanosam) as the working replacement; that
+# mirror is used here, first, for the same reason. The Drive link is the
+# fallback for anyone who'd rather verify against NVIDIA's own listing.
+#
+# resnet18_image_encoder.onnx sha256, for anyone who wants to check it:
+#   d266fcdc9e4f0182b59946cd3cf1be331641f1d0d1de2415c4fd94e7a1c9cf0a
+RESNET18_ONNX_MIRROR="https://raw.githubusercontent.com/johnnynunez/nanosam/main/data/resnet18_image_encoder.onnx"
+RESNET18_ONNX_DRIVE_ID="14-SsvoaTl-esC3JOzomHDnI9OGgdO2OR"
+
 if [[ -f "$DATA_DIR/resnet18_image_encoder.engine" ]]; then
   log "NanoSAM encoder engine already present, skipping"
 else
-  log "Fetching NanoSAM ONNX artefacts"
   if [[ ! -f "$DATA_DIR/resnet18_image_encoder.onnx" ]]; then
-    echo "MISSING: $DATA_DIR/resnet18_image_encoder.onnx"
-    echo "Download it from the NanoSAM README (NVIDIA-AI-IOT/nanosam) and re-run."
-    exit 1
+    log "Fetching resnet18_image_encoder.onnx"
+    if ! curl -fL --retry 4 --retry-delay 2 \
+        -o "$DATA_DIR/resnet18_image_encoder.onnx" "$RESNET18_ONNX_MIRROR"; then
+      rm -f "$DATA_DIR/resnet18_image_encoder.onnx"
+      echo "Mirror fetch failed. Download by hand from NVIDIA's own listing:"
+      echo "  https://drive.google.com/file/d/${RESNET18_ONNX_DRIVE_ID}/view"
+      echo "and save it to $DATA_DIR/resnet18_image_encoder.onnx"
+      exit 1
+    fi
   fi
   log "Building NanoSAM image encoder engine"
   trtexec \
@@ -96,9 +115,21 @@ if [[ -f "$DATA_DIR/mobile_sam_mask_decoder.engine" ]]; then
   log "NanoSAM decoder engine already present, skipping"
 else
   if [[ ! -f "$DATA_DIR/mobile_sam_mask_decoder.onnx" ]]; then
-    echo "MISSING: $DATA_DIR/mobile_sam_mask_decoder.onnx"
-    echo "Export it with nanosam's export script, then re-run."
-    exit 1
+    # This one is produced with nanosam's own export script rather than
+    # fetched pre-built, so nothing here depends on a third-party mirror:
+    # only the mobile_sam.pt checkpoint, which ships in the nanosam repo
+    # itself (assets/mobile_sam.pt).
+    if [[ ! -f "$DATA_DIR/mobile_sam.pt" ]]; then
+      log "Fetching MobileSAM checkpoint"
+      curl -fL --retry 4 --retry-delay 2 \
+        -o "$DATA_DIR/mobile_sam.pt" \
+        "https://raw.githubusercontent.com/NVIDIA-AI-IOT/nanosam/main/assets/mobile_sam.pt"
+    fi
+    log "Exporting NanoSAM mask decoder to ONNX"
+    "$PYTHON" -m nanosam.tools.export_sam_mask_decoder_onnx \
+      --checkpoint="$DATA_DIR/mobile_sam.pt" \
+      --model-type=vit_t \
+      --output="$DATA_DIR/mobile_sam_mask_decoder.onnx"
   fi
   log "Building NanoSAM mask decoder engine"
   trtexec \

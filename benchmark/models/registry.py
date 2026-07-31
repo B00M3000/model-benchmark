@@ -127,19 +127,40 @@ def ensure_repo_paths(config: AppConfig) -> list[str]:
     return added
 
 
+def module_status(module: str) -> tuple[str, str]:
+    """(status, origin) for a required module: ok / shadowed / missing.
+
+    ``shadowed`` is the trap. Every one of these packages is a git clone whose
+    root directory shares its name with the package nested inside it -- so with
+    the clone's *parent* on sys.path (which is the case whenever the process
+    runs from the repo root, since the clones live there), Python resolves the
+    name to the clone root as a PEP 420 namespace package. That import
+    succeeds and find_spec returns a spec, but the package is empty: the real
+    module is one directory deeper. It fails later at the first attribute
+    access, e.g. ``from torch2trt import TRTModule``.
+
+    A namespace package has ``origin is None``, which is how we tell.
+    """
+    try:
+        spec = importlib.util.find_spec(module)
+    except (ImportError, ValueError):
+        return "missing", ""
+    if spec is None:
+        return "missing", ""
+    if spec.origin is None:
+        locations = list(getattr(spec, "submodule_search_locations", None) or [])
+        return "shadowed", locations[0] if locations else ""
+    return "ok", spec.origin
+
+
 def missing_jetson_modules(config: AppConfig | None = None) -> list[str]:
-    """Which of the three model packages cannot be imported on this host."""
+    """Which required packages are not actually usable on this host.
+
+    A shadowed module counts as missing: it imports, but nothing in it works.
+    """
     if config is not None:
         ensure_repo_paths(config)
-    missing = []
-    for module in JETSON_MODULES:
-        try:
-            found = importlib.util.find_spec(module) is not None
-        except (ImportError, ValueError):
-            found = False
-        if not found:
-            missing.append(module)
-    return missing
+    return [m for m in JETSON_MODULES if module_status(m)[0] != "ok"]
 
 
 def jetson_backends_available(config: AppConfig | None = None) -> bool:
