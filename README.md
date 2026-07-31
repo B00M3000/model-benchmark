@@ -264,12 +264,22 @@ python3 -c "import torch, torchvision; print(torch.__file__); print(torchvision.
 
 If one is in `.venv/lib/...` and the other in `/usr/local/lib/python3.10/dist-packages`,
 that's the problem — a venv torchvision paired with the system JetPack torch.
-Install them **together, from the same index**, never one alone:
+Install them **together, from the same index, with `--force-reinstall`**:
 
 ```bash
-.venv/bin/pip uninstall -y torch torchvision
-.venv/bin/pip install --no-cache-dir --index-url https://pypi.jetson-ai-lab.io/jp6/cu126 torch torchvision
+.venv/bin/pip install --no-cache-dir --force-reinstall --no-deps --index-url https://pypi.jetson-ai-lab.io/jp6/cu126 torch torchvision
 ```
+
+**`--force-reinstall` is required, not optional.** With `--system-site-packages`,
+an unconstrained `torchvision` (no version pin) can already be satisfied by
+whatever mismatched build is sitting in system `dist-packages` — so a plain
+`pip install torch torchvision` silently installs only the one pip thinks is
+missing (usually just torch) and leaves the old, mismatched torchvision
+exactly where it was, reproducing this same error. `doctor.py --fix` learned
+this the hard way and now always passes `--force-reinstall`. `--no-deps`
+keeps the reinstall to just these two wheels — without it, `--force-reinstall`
+would also re-fetch every transitive dependency (numpy, pillow, sympy, ...)
+from this Jetson-only index, which likely doesn't host them.
 
 Importing torchvision is not sufficient proof that it works — the failure above
 happens at import, but a subtler mismatch can import cleanly and only fail when

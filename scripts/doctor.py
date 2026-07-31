@@ -176,8 +176,11 @@ def jetson_wheel_index(driver: int | None) -> str:
 
 JETSON_TORCH_FIX = (
     "Install a Jetson-matched build instead, e.g. for JetPack 6.x / CUDA 12.6:\n    "
-    "  pip install --no-cache-dir --index-url "
+    "  pip install --no-cache-dir --force-reinstall --no-deps --index-url "
     "https://pypi.jetson-ai-lab.io/jp6/cu126 torch torchvision\n    "
+    "(--force-reinstall matters: with --system-site-packages, an unconstrained\n    "
+    "'torchvision' can already be 'satisfied' by a mismatched system build, so\n    "
+    "pip silently skips reinstalling it without this flag.)\n    "
     "Then install the model repos with --no-deps so pip cannot replace it again."
 )
 
@@ -191,7 +194,15 @@ def install_matched_torch(driver: int | None):
     deleting the venv.
 
     torch and torchvision go in together, always -- installing one alone is
-    what produces "operator torchvision::nms does not exist".
+    what produces "operator torchvision::nms does not exist". That failure
+    mode is also what happens if this command runs WITHOUT --force-reinstall:
+    with --system-site-packages, an unconstrained "torchvision" is already
+    satisfied by whatever mismatched build sits in system dist-packages, so
+    pip silently skips it and installs only torch -- pairing a fresh,
+    driver-matched torch with the old, mismatched torchvision. --no-deps
+    keeps this to exactly those two wheels; without it, --force-reinstall
+    would also re-fetch every transitive dependency (numpy, pillow, sympy,
+    ...) from this Jetson-only index, which likely doesn't host them.
     """
     if sys.prefix == sys.base_prefix:
         return None  # would modify the system install; too blunt to automate
@@ -201,6 +212,7 @@ def install_matched_torch(driver: int | None):
             "install driver-matched torch + torchvision into the venv",
             [
                 sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                "--force-reinstall", "--no-deps",
                 "--index-url", jetson_wheel_index(driver),
                 "torch", "torchvision",
             ],
@@ -288,7 +300,7 @@ def check_torch() -> None:
         return
 
     ok("torch.cuda", f"{torch.cuda.get_device_name(0)}")
-    check_torchvision(torch)
+    check_torchvision(torch, driver)
 
 
 def check_numpy(torch) -> None:
@@ -323,13 +335,15 @@ def check_numpy(torch) -> None:
 MATCHED_PAIR_FIX = (
     "torch and torchvision must be a matched pair from the same build.\n    "
     "Reinstall BOTH together, never one alone -- for JetPack 6.x / CUDA 12.6:\n    "
-    "  pip uninstall -y torch torchvision\n    "
-    "  pip install --no-cache-dir --index-url "
-    "https://pypi.jetson-ai-lab.io/jp6/cu126 torch torchvision"
+    "  pip install --no-cache-dir --force-reinstall --no-deps --index-url "
+    "https://pypi.jetson-ai-lab.io/jp6/cu126 torch torchvision\n    "
+    "(--force-reinstall matters here: with --system-site-packages, pip can "
+    "decide\n    an unconstrained 'torchvision' is already satisfied by the "
+    "mismatched\n    build and silently skip reinstalling it.)"
 )
 
 
-def check_torchvision(torch) -> None:
+def check_torchvision(torch, driver: int | None = None) -> None:
     """NanoOWL imports torchvision.ops.roi_align, so this must actually work.
 
     A torchvision whose compiled extension was built against a different
@@ -346,6 +360,7 @@ def check_torchvision(torch) -> None:
             "torchvision not importable",
             "NanoOWL needs torchvision.ops.roi_align",
             MATCHED_PAIR_FIX,
+            fix_action=install_matched_torch(driver),
         )
         return
     except RuntimeError as exc:
@@ -354,6 +369,7 @@ def check_torchvision(torch) -> None:
             str(exc).splitlines()[0],
             "Its compiled ops were built against a different torch.\n    "
             + MATCHED_PAIR_FIX,
+            fix_action=install_matched_torch(driver),
         )
         return
 
@@ -366,6 +382,7 @@ def check_torchvision(torch) -> None:
             "torch and torchvision are in different site-packages",
             f"torch={torch_root}  torchvision={tv_root}",
             "They are probably not a matched pair. " + MATCHED_PAIR_FIX,
+            fix_action=install_matched_torch(driver),
         )
 
     try:
@@ -382,6 +399,7 @@ def check_torchvision(torch) -> None:
             "torchvision ops are not registered",
             f"{type(exc).__name__}: {str(exc).splitlines()[0]}",
             MATCHED_PAIR_FIX,
+            fix_action=install_matched_torch(driver),
         )
 
 

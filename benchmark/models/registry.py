@@ -7,7 +7,9 @@ segmentation head -- that is the whole point of the ablation.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -140,17 +142,55 @@ def ensure_repo_paths(config: AppConfig) -> list[str]:
 def module_status(module: str) -> tuple[str, str]:
     """(status, origin) for a required module: ok / shadowed / missing.
 
-    ``shadowed`` is the trap. Every one of these packages is a git clone whose
-    root directory shares its name with the package nested inside it -- so with
-    the clone's *parent* on sys.path (which is the case whenever the process
-    runs from the repo root, since the clones live there), Python resolves the
-    name to the clone root as a PEP 420 namespace package. That import
-    succeeds and find_spec returns a spec, but the package is empty: the real
-    module is one directory deeper. It fails later at the first attribute
-    access, e.g. ``from torch2trt import TRTModule``.
+    Deliberately checked via ``importlib.metadata``, not ``importlib.util.
+    find_spec``. find_spec asks ``sys.meta_path`` finders in order and uses
+    the first non-None answer -- and for a *editable* pip install (the
+    ``pip install -e`` used throughout this project), that answer can come
+    from the wrong finder.
 
-    A namespace package has ``origin is None``, which is how we tell.
+    Every one of these packages is a git clone whose root directory shares
+    its name with the package nested inside it. Whenever that clone root is
+    on ``sys.path`` (true for this whole app, which adds the repo root to
+    import itself), Python's default ``PathFinder`` -- earlier in
+    ``sys.meta_path`` than pip's own editable-install finder -- notices a
+    directory named e.g. ``nanosam`` with no ``__init__.py`` and returns a
+    namespace-package spec for it *before pip's finder is ever consulted*,
+    even when the package is genuinely, correctly installed elsewhere via
+    ``pip install -e``. So even right after a real, successful install,
+    find_spec can still report the empty shadow instead of the real thing.
+
+    ``importlib.metadata`` sidesteps all of this: it reads ``*.dist-info``
+    directly rather than resolving an import, so it is unaffected by which
+    meta_path finder gets asked first.
     """
+    try:
+        dist = importlib.metadata.distribution(module)
+    except importlib.metadata.PackageNotFoundError:
+        dist = None
+
+    if dist is not None:
+        origin = ""
+        try:
+            direct_url = dist.read_text("direct_url.json")
+            if direct_url:
+                info = json.loads(direct_url)
+                url = info.get("url", "")
+                if url.startswith("file://"):
+                    origin = url[len("file://") :]
+        except Exception:
+            pass
+        if not origin:
+            location = dist.locate_file("")
+            origin = str(location) if location else ""
+        return "ok", origin
+
+    # No pip distribution anywhere. Fall back to ordinary import resolution --
+    # this is what makes config.repo_paths work with no pip install at all,
+    # and what finds JetPack packages (torch, tensorrt) that were never pip-
+    # installed and so have no dist-info for the check above to find. A clone
+    # directory alone still "imports" successfully as an empty namespace
+    # package (spec.origin is None); tell that apart from a genuine ordinary
+    # import and from nothing being present at all.
     try:
         spec = importlib.util.find_spec(module)
     except (ImportError, ValueError):
