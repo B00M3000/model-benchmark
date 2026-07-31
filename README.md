@@ -137,6 +137,9 @@ git clone https://github.com/NVIDIA-AI-IOT/torch2trt
 .venv/bin/pip install -e nanosam      --no-deps
 .venv/bin/pip install -e efficientvit --no-deps
 .venv/bin/pip install    ./torch2trt  --no-deps --no-build-isolation
+
+# NOT --no-deps: see below.
+.venv/bin/pip install transformers
 ```
 
 **`torch2trt` is easy to miss.** It is not on PyPI and neither NanoOWL nor
@@ -147,13 +150,26 @@ loading the finished engine back (`ModuleNotFoundError: No module named
 'torch2trt'`). The engine it just built is fine; only the verification step
 failed.
 
-**Always pass `--no-deps`.** All four declare `torch` as a dependency (torch2trt
-also declares `tensorrt`), and pip will happily pull a PyPI wheel over JetPack's
-build, which then fails at runtime with *"The NVIDIA driver on your system is
-too old"*. The cost is that their other requirements (`transformers`, `timm`, …)
-aren't installed automatically — add those individually as the import errors
-name them. That trade is worth making: a broken torch is far more painful to
-unpick than a missing pure-Python package.
+**Always pass `--no-deps` for the four repos above.** All four declare `torch`
+as a dependency (torch2trt also declares `tensorrt`), and pip will happily pull
+a PyPI wheel over JetPack's build, which then fails at runtime with *"The
+NVIDIA driver on your system is too old"*.
+
+**`transformers` is the one exception — install it *without* `--no-deps`.**
+NanoOWL's `owl_predictor.py` imports `OwlViTForObjectDetection` from it at
+runtime, but nanoowl's own `setup.py` declares no dependencies at all, so
+nothing pulls `transformers` in. Unlike the four repos above, `transformers`
+does **not** declare `torch` as a hard dependency (only as an optional extra),
+so there's nothing here for `--no-deps` to protect against — and skipping it
+means discovering `transformers`' own dependency chain one missing piece at a
+time: first `ModuleNotFoundError: No module named 'idna'`, fix that and hit
+the next one, and so on, since `httpx` needs `idna`, `huggingface_hub` needs
+`httpx`, and `transformers` needs `huggingface_hub`. A plain
+`pip install transformers` resolves the whole chain correctly in one shot —
+this is also exactly what [NanoOWL's own README](https://github.com/NVIDIA-AI-IOT/nanoowl#setup)
+says to run. Its only unconstrained core dependency is `numpy>=1.17`, already
+satisfied by the pinned `numpy<2` install, so pip leaves it alone rather than
+upgrading it.
 
 Check the environment at any point:
 
@@ -211,6 +227,40 @@ existing engine file and moves on.
 On TensorRT 10 (JetPack 6), install torch2trt from master rather than a release:
 older releases drive engines through the removed binding API and fail at
 inference with `no attribute 'num_bindings'`. The doctor flags this.
+
+### "No module named 'idna'" (or `httpx`, `huggingface_hub`, or any other piece of `transformers`' dependency chain)
+
+```
+File "nanoowl/owl_predictor.py", line 24, in <module>
+    from transformers.models.owlvit.modeling_owlvit import OwlViTForObjectDetection
+  ...
+  File ".../huggingface_hub/utils/__init__.py", line 16, in <module>
+    from huggingface_hub.errors import (...)
+  ...
+  File ".../httpx/_urls.py", line 6, in <module>
+    import idna
+ModuleNotFoundError: No module named 'idna'
+```
+
+NanoOWL imports `transformers` at runtime, but nanoowl's own `setup.py`
+declares no dependencies, so nothing installs it. Fixing this one traceback at
+a time is a trap: `idna` is missing because `httpx` needs it, `httpx` is
+missing because `huggingface_hub` needs it, and so on — each fix just reveals
+the next link in the chain. Install `transformers` itself instead, and let pip
+resolve the whole chain in one shot:
+
+```bash
+.venv/bin/pip install transformers
+```
+
+**Deliberately not `--no-deps` here** — unlike the four repos above,
+`transformers` doesn't declare `torch` as a hard dependency (only as an
+optional extra), so there's no risk of it replacing JetPack's build. Its only
+unconstrained core dependency is `numpy>=1.17`, already satisfied by the
+pinned `numpy<2` install, so pip leaves it in place rather than upgrading it.
+`scripts/doctor.py` checks this by attempting the exact import NanoOWL
+performs, so it names whichever link in the chain is actually missing rather
+than guessing.
 
 ### "No module named 'nanosam.tools'" (or any `<pkg>.<submodule>` after a supposedly clean install)
 

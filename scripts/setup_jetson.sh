@@ -114,5 +114,23 @@ EOF
   done
 fi
 
+# transformers is not one of the four repos above -- it's a separate PyPI
+# package NanoOWL imports at runtime (owl_predictor.py, for
+# OwlViTForObjectDetection). NanoOWL's own setup.py declares no dependencies
+# (it's installed with --no-deps above regardless, since letting pip resolve
+# it would replace JetPack's torch), and NVIDIA's own README lists this as a
+# separate, explicit step. Deliberately NOT --no-deps here: transformers'
+# only unconstrained core dependency is numpy>=1.17, already satisfied by the
+# pinned numpy<2 install, so pip leaves it alone rather than upgrading it --
+# and letting pip resolve the rest (huggingface_hub, httpx, idna, ...)
+# normally is what avoids discovering each missing piece one traceback at a
+# time.
+log "transformers (NanoOWL's runtime dependency)"
+if "$PYTHON" -c 'from transformers.models.owlvit.modeling_owlvit import OwlViTForObjectDetection' >/dev/null 2>&1; then
+  ok "already importable"
+else
+  "$PYTHON" -m pip install transformers
+fi
+
 log "Verifying"
 "$PYTHON" scripts/doctor.py

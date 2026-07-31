@@ -521,6 +521,59 @@ def install_module(required, origin: str):
     return run
 
 
+def install_transformers() -> bool:
+    # No --no-deps: unlike the four repos above, transformers does not
+    # declare torch as a dependency (only as an optional extra), so a plain
+    # install can't replace JetPack's build. Its only unconstrained core
+    # dependency of note is numpy>=1.17 -- already satisfied by the pinned
+    # numpy<2 install, so pip leaves it alone rather than upgrading it.
+    return run_fix(
+        "install transformers (NanoOWL's runtime dependency)",
+        [sys.executable, "-m", "pip", "install", "transformers"],
+    )
+
+
+def check_nanoowl_runtime() -> None:
+    """NanoOWL imports transformers at runtime, but nothing installs it.
+
+    nanoowl's own setup.py declares zero dependencies, and it must be
+    installed with --no-deps anyway (its README lists torch as a manual
+    prerequisite, and letting pip resolve it would replace JetPack's build).
+    NVIDIA's own README instead lists `pip install transformers` as a
+    separate, explicit setup step -- deliberately without --no-deps, since
+    that is what pulls in transformers' own working dependency chain
+    (huggingface_hub, httpx, idna, and the rest). Skipping that step doesn't
+    fail at nanoowl's own import; it fails one or two frames deeper, inside
+    transformers' import of OwlViTForObjectDetection, with whichever piece of
+    that chain happens to be missing (idna, httpx, huggingface_hub, ...).
+    Since the fix is the same regardless of which one it is, this checks the
+    exact import NanoOWL performs rather than guessing dependency names.
+    """
+    section("NanoOWL runtime (transformers)")
+    try:
+        from transformers.models.owlvit.modeling_owlvit import (  # noqa: F401
+            OwlViTForObjectDetection,
+        )
+    except ModuleNotFoundError as exc:
+        bad(
+            f"{exc.name} not importable",
+            "part of transformers' own dependency chain -- NanoOWL needs it "
+            "to import OwlViTForObjectDetection",
+            "pip install transformers      # deliberately not --no-deps here; "
+            "see the comment on check_nanoowl_runtime for why that's safe",
+            fix_action=install_transformers,
+        )
+        return
+    except ImportError as exc:
+        bad(
+            "transformers import failed",
+            str(exc).splitlines()[0],
+            fix_action=install_transformers,
+        )
+        return
+    ok("transformers", "OwlViTForObjectDetection importable")
+
+
 def check_torch2trt() -> None:
     """torch2trt is what actually executes the .engine files.
 
@@ -687,6 +740,7 @@ CHECKS = (
     check_opencv,
     check_tensorrt,
     check_models,
+    check_nanoowl_runtime,
     check_torch2trt,
     check_artifacts,
     check_clocks,
