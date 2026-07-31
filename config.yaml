@@ -1,0 +1,68 @@
+# Ablation study configuration.
+#
+# Paths are relative to the repository root. Everything here can also be
+# overridden per job from the web UI (run section) or by environment
+# variables (BENCH_BACKEND, BENCH_PORT, BENCH_HOST, BENCH_DATA_DIR).
+
+# auto   - use the Jetson backends when importable, else fall back to mock
+# jetson - require the real backends; fail loudly if they are missing
+# mock   - CPU stand-ins with synthetic latency, for development only
+backend: auto
+
+nanoowl:
+  model_name: google/owlvit-base-patch32
+  image_encoder_engine: data/owl_image_encoder_patch32.engine
+  device: cuda
+
+nanosam:
+  image_encoder_engine: data/resnet18_image_encoder.engine
+  mask_decoder_engine: data/mobile_sam_mask_decoder.engine
+
+efficientvit:
+  model: efficientvit-sam-l0
+  weights: data/efficientvit_sam_l0.pt
+  # auto prefers TensorRT when both engines exist, else PyTorch
+  runtime: auto
+  encoder_engine: data/efficientvit_sam_l0_encoder.engine
+  decoder_engine: data/efficientvit_sam_l0_decoder.engine
+  device: cuda
+
+# Defaults for a run; the UI can override each of these per job.
+run:
+  prompts:
+    - a person
+  threshold: 0.1
+  stride: 1
+  max_frames: null
+  # Frames that are executed but excluded from the reported statistics.
+  # Without this the first TensorRT/cuDNN calls dominate the mean.
+  warmup_frames: 10
+  record_masks: true
+
+# How models are held across the two runs of a single job. Both pairings
+# always execute in one process; these control what stays resident.
+lifecycle:
+  # Keep NanoOWL loaded across both runs. Identical weights and text
+  # encodings either way, so reloading only costs engine deserialisation.
+  # Each pairing still runs its own detection pass -- no boxes are shared.
+  share_detector: true
+  # Load both segmenters up front for the smallest inter-run gap, at the
+  # cost of higher peak VRAM.
+  preload_all_models: false
+  # Tear down and rebuild everything between runs for maximum isolation.
+  reload_between_runs: false
+
+video:
+  enabled: true
+  panel_width: 960
+  fps: null          # null inherits the source frame rate
+  mask_alpha: 0.45
+  codec: mp4v
+  draw_stats: true
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  data_dir: data/jobs
+  max_upload_mb: 2048
+  keep_jobs: 50

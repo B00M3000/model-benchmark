@@ -1,0 +1,20 @@
+# Benchmark artefacts: uploads, per-frame records, rendered videos
+data/
+
+# Model weights and TensorRT engines are host-specific and large
+*.engine
+*.onnx
+*.pt
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+.DS_Store
+*.swp
+.idea/
+.vscode/

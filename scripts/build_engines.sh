@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Fetch weights and build the TensorRT engines this study needs.
+#
+# Run once on the Jetson Orin, from the repository root. Engine files are
+# tied to the exact TensorRT version and GPU they were built on, so they
+# cannot be copied from another machine -- they must be built here.
+#
+# Expects nanoowl, nanosam and efficientvit to already be installed against
+# the JetPack torch/TensorRT build. See README.md.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+DATA_DIR="${DATA_DIR:-data}"
+mkdir -p "$DATA_DIR"
+
+log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+if ! have trtexec; then
+  export PATH="/usr/src/tensorrt/bin:$PATH"
+fi
+
+# ── NanoOWL: OWL-ViT image encoder ────────────────────────────────────────
+if [[ -f "$DATA_DIR/owl_image_encoder_patch32.engine" ]]; then
+  log "NanoOWL engine already present, skipping"
+else
+  log "Building NanoOWL image encoder engine (several minutes)"
+  python3 -m nanoowl.build_image_encoder_engine \
+    "$DATA_DIR/owl_image_encoder_patch32.engine"
+fi
+
+# ── NanoSAM: ResNet18 encoder + MobileSAM mask decoder ────────────────────
+if [[ -f "$DATA_DIR/resnet18_image_encoder.engine" ]]; then
+  log "NanoSAM encoder engine already present, skipping"
+else
+  log "Fetching NanoSAM ONNX artefacts"
+  if [[ ! -f "$DATA_DIR/resnet18_image_encoder.onnx" ]]; then
+    echo "MISSING: $DATA_DIR/resnet18_image_encoder.onnx"
+    echo "Download it from the NanoSAM README (NVIDIA-AI-IOT/nanosam) and re-run."
+    exit 1
+  fi
+  log "Building NanoSAM image encoder engine"
+  trtexec \
+    --onnx="$DATA_DIR/resnet18_image_encoder.onnx" \
+    --saveEngine="$DATA_DIR/resnet18_image_encoder.engine" \
+    --fp16
+fi
+
+if [[ -f "$DATA_DIR/mobile_sam_mask_decoder.engine" ]]; then
+  log "NanoSAM decoder engine already present, skipping"
+else
+  if [[ ! -f "$DATA_DIR/mobile_sam_mask_decoder.onnx" ]]; then
+    echo "MISSING: $DATA_DIR/mobile_sam_mask_decoder.onnx"
+    echo "Export it with nanosam's export script, then re-run."
+    exit 1
+  fi
+  log "Building NanoSAM mask decoder engine"
+  trtexec \
+    --onnx="$DATA_DIR/mobile_sam_mask_decoder.onnx" \
+    --saveEngine="$DATA_DIR/mobile_sam_mask_decoder.engine" \
+    --fp16 \
+    --minShapes=point_coords:1x1x2,point_labels:1x1 \
+    --optShapes=point_coords:1x4x2,point_labels:1x4 \
+    --maxShapes=point_coords:1x8x2,point_labels:1x8
+fi
+
+# ── EfficientViT-SAM ──────────────────────────────────────────────────────
+# The PyTorch path works out of the box with just the checkpoint; the
+# TensorRT engines are optional but markedly faster. config.yaml's
+# runtime: auto picks the engines when they exist.
+if [[ ! -f "$DATA_DIR/efficientvit_sam_l0.pt" ]]; then
+  log "Downloading EfficientViT-SAM-L0 checkpoint"
+  curl -fL --retry 4 --retry-delay 2 -o "$DATA_DIR/efficientvit_sam_l0.pt" \
+    "https://huggingface.co/mit-han-lab/efficientvit-sam/resolve/main/efficientvit_sam_l0.pt"
+else
+  log "EfficientViT-SAM checkpoint already present, skipping"
+fi
+
+if [[ -f "$DATA_DIR/efficientvit_sam_l0_encoder.onnx" \
+   && ! -f "$DATA_DIR/efficientvit_sam_l0_encoder.engine" ]]; then
+  log "Building EfficientViT-SAM encoder engine"
+  trtexec \
+    --onnx="$DATA_DIR/efficientvit_sam_l0_encoder.onnx" \
+    --saveEngine="$DATA_DIR/efficientvit_sam_l0_encoder.engine" \
+    --fp16
+fi
+
+if [[ -f "$DATA_DIR/efficientvit_sam_l0_decoder.onnx" \
+   && ! -f "$DATA_DIR/efficientvit_sam_l0_decoder.engine" ]]; then
+  log "Building EfficientViT-SAM decoder engine"
+  trtexec \
+    --onnx="$DATA_DIR/efficientvit_sam_l0_decoder.onnx" \
+    --saveEngine="$DATA_DIR/efficientvit_sam_l0_decoder.engine" \
+    --fp16 \
+    --minShapes=point_coords:1x1x2,point_labels:1x1 \
+    --optShapes=point_coords:1x4x2,point_labels:1x4 \
+    --maxShapes=point_coords:1x8x2,point_labels:1x8
+fi
+
+log "Done. Artefacts in $DATA_DIR:"
+ls -lh "$DATA_DIR" | grep -E '\.(engine|pt)$' || true
+
+cat <<'EOF'
+
+Before benchmarking, pin the clocks or the numbers will be noise:
+
+    sudo nvpmodel -m 0
+    sudo jetson_clocks
+
+Then start the server:
+
+    ./scripts/run.sh
+EOF

@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Ablation Study · Jetson Orin</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>◐</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◐</span>
+    <div>
+      <h1>Model Ablation Study</h1>
+      <p>NanoOWL&nbsp;+&nbsp;NanoSAM &nbsp;vs&nbsp; NanoOWL&nbsp;+&nbsp;EfficientViT-SAM &nbsp;·&nbsp; Jetson Orin</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <div id="backend-badge" class="badge badge-muted">checking backend…</div>
+    <button id="history-toggle" class="btn btn-ghost" type="button">History</button>
+  </div>
+</header>
+
+<div id="history-panel" class="history hidden">
+  <div class="history-head">
+    <h3>Previous runs</h3>
+    <button id="history-close" class="btn btn-ghost btn-sm" type="button">Close</button>
+  </div>
+  <div id="history-list" class="history-list"></div>
+</div>
+
+<main>
+
+  <!-- ── 1. Upload & configure ─────────────────────────────────────────── -->
+  <section id="setup" class="card">
+    <div class="card-head">
+      <h2><span class="step-num">1</span> Upload &amp; configure</h2>
+      <p class="muted">Both pairings run sequentially in a single process on the Orin.</p>
+    </div>
+
+    <div id="dropzone" class="dropzone" tabindex="0" role="button"
+         aria-label="Choose a video file or drop one here">
+      <input id="file-input" type="file" accept="video/*" hidden>
+      <svg class="drop-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" fill="none" stroke="currentColor"
+              stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M3.5 15v3a2.5 2.5 0 0 0 2.5 2.5h12a2.5 2.5 0 0 0 2.5-2.5v-3" fill="none"
+              stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      <p class="drop-title">Drop a video here, or <span class="link">browse</span></p>
+      <p class="muted small">mp4 · mov · avi · mkv · webm</p>
+      <div id="file-chip" class="file-chip hidden">
+        <span id="file-name"></span>
+        <span id="file-size" class="muted"></span>
+        <button id="file-clear" class="chip-x" type="button" aria-label="Remove file">×</button>
+      </div>
+    </div>
+
+    <div class="config-grid">
+      <label class="field field-wide">
+        <span class="field-label">Detection prompts
+          <em class="muted">— NanoOWL is open-vocabulary, so it needs text</em></span>
+        <input id="prompts" type="text" placeholder="a person, a car, a backpack" value="a person">
+        <span class="hint">Comma-separated. These drive both pairings identically.</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Detection threshold</span>
+        <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.1">
+        <span class="hint">Lower finds more, and costs more mask decodes.</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Frame stride</span>
+        <input id="stride" type="number" min="1" step="1" value="1">
+        <span class="hint">1 = every frame.</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Max frames</span>
+        <input id="max-frames" type="number" min="1" step="1" placeholder="whole video">
+        <span class="hint">Blank runs the entire clip.</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Warm-up frames</span>
+        <input id="warmup" type="number" min="0" step="1" value="10">
+        <span class="hint">Run but excluded from stats. 0 includes everything.</span>
+      </label>
+
+      <label class="field field-check">
+        <input id="record-masks" type="checkbox" checked>
+        <span>
+          <span class="field-label">Record masks for the comparison video</span>
+          <span class="hint">Encoded off-thread. Uncheck for a zero-overhead latency run.</span>
+        </span>
+      </label>
+    </div>
+
+    <div class="actions">
+      <button id="start-btn" class="btn btn-primary" type="button" disabled>Run benchmark</button>
+      <span id="setup-error" class="error-text"></span>
+    </div>
+  </section>
+
+  <!-- ── 2. Live progress ──────────────────────────────────────────────── -->
+  <section id="progress" class="card hidden">
+    <div class="card-head">
+      <h2><span class="step-num">2</span> Processing</h2>
+      <div class="head-right">
+        <span id="job-id-chip" class="chip muted"></span>
+        <button id="cancel-btn" class="btn btn-ghost btn-sm" type="button">Cancel</button>
+      </div>
+    </div>
+
+    <ol id="stepper" class="stepper"></ol>
+
+    <div id="queue-note" class="note hidden"></div>
+    <div id="job-error" class="note note-error hidden"></div>
+
+    <div id="live" class="live hidden">
+      <div class="live-head">
+        <span id="live-label" class="live-label"></span>
+        <span id="live-counter" class="muted mono"></span>
+      </div>
+      <div class="progressbar"><div id="live-bar" class="progressbar-fill"></div></div>
+      <div class="live-stats">
+        <div class="live-stat"><span class="live-stat-value mono" id="live-latency">—</span><span class="live-stat-label">frame latency</span></div>
+        <div class="live-stat"><span class="live-stat-value mono" id="live-fps">—</span><span class="live-stat-label">instantaneous FPS</span></div>
+        <div class="live-stat"><span class="live-stat-value mono" id="live-dets">—</span><span class="live-stat-label">detections</span></div>
+      </div>
+      <svg id="sparkline" class="sparkline" viewBox="0 0 600 90" preserveAspectRatio="none"></svg>
+    </div>
+  </section>
+
+  <!-- ── 3. Results ────────────────────────────────────────────────────── -->
+  <section id="results" class="hidden">
+
+    <div class="card">
+      <div class="card-head">
+        <h2><span class="step-num">3</span> Results</h2>
+        <div class="head-right">
+          <a id="dl-json" class="btn btn-ghost btn-sm" download>results.json</a>
+          <a id="dl-csv" class="btn btn-ghost btn-sm" download>per-frame CSV</a>
+        </div>
+      </div>
+      <div id="verdict" class="verdict"></div>
+      <div id="pairing-cards" class="pairing-cards"></div>
+      <div id="run-meta" class="run-meta"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Where the time goes</h3>
+        <p class="muted">Mean cost per stage. Detection is identical by design — the segmenter is the variable.</p></div>
+      <div id="stage-chart" class="chart"></div>
+      <div id="stage-table-wrap" class="table-wrap"><table id="stage-table" class="data-table"></table></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Latency over time</h3>
+        <p class="muted">Per-frame pipeline latency. Shaded band marks excluded warm-up frames.</p></div>
+      <div id="series-chart" class="chart"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Latency distribution</h3>
+        <p class="muted">Tail latency and jitter matter more than the average for real-time control.</p></div>
+      <div id="hist-chart" class="chart"></div>
+      <div class="table-wrap"><table id="percentile-table" class="data-table"></table></div>
+    </div>
+
+    <div id="video-card" class="card">
+      <div class="card-head"><h3>Side-by-side comparison</h3>
+        <p class="muted">Rendered after the measurements — mask quality is judged here by eye.</p></div>
+      <div id="video-slot"></div>
+    </div>
+
+  </section>
+</main>
+
+<footer class="footer">
+  <span id="footer-env" class="mono muted small"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
