@@ -143,5 +143,17 @@ else
   "$PYTHON" -m pip install onnx
 fi
 
+# timm, unlike transformers/onnx, DOES get --no-deps: its pyproject.toml
+# declares torch and torchvision as hard dependencies, so a plain install
+# risks replacing JetPack's build. Its other dependencies (pyyaml,
+# huggingface_hub, safetensors) are already covered by the transformers
+# install above.
+log "timm (nanosam's vendored MobileSAM needs it)"
+if "$PYTHON" -c 'from nanosam.mobile_sam import sam_model_registry' >/dev/null 2>&1; then
+  ok "already importable"
+else
+  "$PYTHON" -m pip install timm --no-deps
+fi
+
 log "Verifying"
 "$PYTHON" scripts/doctor.py

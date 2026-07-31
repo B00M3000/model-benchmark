@@ -141,6 +141,9 @@ git clone https://github.com/NVIDIA-AI-IOT/torch2trt
 # Neither of these gets --no-deps: see below.
 .venv/bin/pip install transformers
 .venv/bin/pip install onnx
+
+# This one DOES get --no-deps -- see below.
+.venv/bin/pip install timm --no-deps
 ```
 
 **`torch2trt` is easy to miss.** It is not on PyPI and neither NanoOWL nor
@@ -182,6 +185,19 @@ fail on the last line with `torch.onnx.OnnxExporterError: Module onnx is not
 installed!`. Same reasoning as `transformers`: `onnx` doesn't depend on
 `torch`, and its `numpy>=1.23.2` is already satisfied, so a plain
 `pip install onnx` is safe and complete.
+
+**`timm` is the odd one out — it needs `--no-deps`, the opposite of the two
+above.** NanoSAM vendors MobileSAM, and
+`mobile_sam/modeling/tiny_vit_sam.py` imports `timm.models.layers`, reached
+the moment the mask-decoder ONNX export script runs. nanosam's own
+`setup.py` declares no dependencies (same reason as nanoowl — it must be
+installed with `--no-deps` too), so nothing pulls `timm` in. But unlike
+`transformers`/`onnx`, `timm`'s `pyproject.toml` lists `torch` **and**
+`torchvision` as hard, unconstrained dependencies — installing it without
+`--no-deps` risks the exact "PyPI wheel replaces JetPack's build" failure all
+of this is trying to avoid. `timm`'s three other dependencies (`pyyaml`,
+`huggingface_hub`, `safetensors`) are already satisfied by the `transformers`
+install above, so `--no-deps` doesn't actually skip anything real here.
 
 Check the environment at any point:
 
@@ -306,6 +322,32 @@ weights never get their turn either — `doctor.py` will still list all of
 them as missing afterward even though only this one thing was actually
 blocking anything. Re-running the script after installing `onnx` lets every
 step after the first one finally run.
+
+### "No module named 'timm'"
+
+```
+File ".../nanosam/mobile_sam/modeling/tiny_vit_sam.py", line 15, in <module>
+    from timm.models.layers import DropPath as TimmDropPath,\
+ModuleNotFoundError: No module named 'timm'
+```
+
+NanoSAM vendors MobileSAM, and its TinyViT image encoder imports `timm` --
+reached the moment `nanosam.mobile_sam.sam_model_registry` is imported, which
+the mask-decoder ONNX export script does on its very first line. nanosam
+itself declares no dependencies (installed with `--no-deps`, like the other
+three repos), so nothing pulls `timm` in.
+
+```bash
+.venv/bin/pip install timm --no-deps
+```
+
+**This one keeps `--no-deps`, unlike `transformers`/`onnx` above.** `timm`'s
+`pyproject.toml` lists `torch` and `torchvision` as hard, unconstrained
+dependencies, so installing it without `--no-deps` risks pip replacing
+JetPack's build — the exact failure the rest of this guide exists to prevent.
+`timm`'s other three dependencies (`pyyaml`, `huggingface_hub`,
+`safetensors`) are already satisfied once `transformers` is installed, so
+nothing real is lost by skipping them.
 
 ### "No module named 'nanosam.tools'" (or any `<pkg>.<submodule>` after a supposedly clean install)
 

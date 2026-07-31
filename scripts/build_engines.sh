@@ -164,6 +164,31 @@ else
 or by hand:
     git clone https://github.com/NVIDIA-AI-IOT/nanosam
     pip install ./nanosam --no-deps"
+
+    # nanosam itself being installed doesn't mean its vendored MobileSAM does
+    # -- mobile_sam/modeling/tiny_vit_sam.py imports timm, which nanosam
+    # doesn't declare (installed with --no-deps, like the rest). Checked
+    # here, not left to the doctor preflight alone, for the same reason as
+    # the onnx check above: that preflight can be waved past, and this way
+    # the failure is instant instead of after the checkpoint download.
+    if ! "$PYTHON" -c 'from nanosam.mobile_sam import sam_model_registry' >/dev/null 2>&1; then
+      cat <<'EOF' >&2
+
+timm is not installed, and nanosam's vendored MobileSAM needs it
+(mobile_sam/modeling/tiny_vit_sam.py imports timm.models.layers).
+
+    pip install timm --no-deps
+
+--no-deps matters here: unlike transformers/onnx, timm declares torch AND
+torchvision as hard dependencies, so a plain install risks replacing
+JetPack's build. timm's other dependencies (pyyaml, huggingface_hub,
+safetensors) are already installed via the transformers step, so nothing
+is lost by skipping them.
+
+EOF
+      exit 1
+    fi
+
     log "Exporting NanoSAM mask decoder to ONNX"
     "$PYTHON" -m nanosam.tools.export_sam_mask_decoder_onnx \
       --checkpoint="$DATA_DIR/mobile_sam.pt" \

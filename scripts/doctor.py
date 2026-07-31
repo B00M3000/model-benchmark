@@ -574,6 +574,70 @@ def check_nanoowl_runtime() -> None:
     ok("transformers", "OwlViTForObjectDetection importable")
 
 
+def install_timm() -> bool:
+    # --no-deps, unlike transformers/onnx: timm's pyproject.toml declares
+    # torch AND torchvision as hard dependencies (unconstrained), so a plain
+    # install risks pip replacing JetPack's build. --no-deps is safe here
+    # specifically because timm's only OTHER dependencies (pyyaml,
+    # huggingface_hub, safetensors) are already satisfied by the transformers
+    # install above -- nothing legitimate is being skipped.
+    return run_fix(
+        "install timm (NanoSAM's vendored MobileSAM needs it) -- --no-deps, "
+        "since timm declares torch/torchvision as hard dependencies",
+        [sys.executable, "-m", "pip", "install", "timm", "--no-deps"],
+    )
+
+
+def check_nanosam_runtime() -> None:
+    """NanoSAM's vendored MobileSAM imports timm, but nothing installs it.
+
+    nanosam/mobile_sam/modeling/tiny_vit_sam.py does
+    `from timm.models.layers import DropPath` -- reached from
+    `nanosam.mobile_sam.sam_model_registry`, which the mask-decoder ONNX
+    export script imports at its very first line. nanosam's own setup.py
+    declares no dependencies (like nanoowl, and for the same reason: it must
+    be installed with --no-deps so pip can't replace JetPack's torch), so
+    nothing pulls timm in.
+
+    Unlike transformers and onnx, timm's own pyproject.toml lists torch and
+    torchvision as hard, unconstrained dependencies -- so timm gets --no-deps
+    instead. Its other three dependencies (pyyaml, huggingface_hub,
+    safetensors) are already satisfied by the transformers install this
+    doctor also checks for, so nothing is actually lost by skipping them.
+
+    Skipped entirely if nanosam itself isn't really installed --
+    check_models() already reports that, and this would just add a second,
+    differently-worded warning about the same underlying problem.
+    """
+    from benchmark.models.registry import module_status
+
+    if module_status("nanosam")[0] != "ok":
+        return
+
+    section("NanoSAM runtime (timm)")
+    try:
+        from nanosam.mobile_sam import sam_model_registry  # noqa: F401
+    except ModuleNotFoundError as exc:
+        bad(
+            f"{exc.name} not importable",
+            "needed by nanosam's vendored MobileSAM "
+            "(mobile_sam/modeling/tiny_vit_sam.py)",
+            "pip install timm --no-deps      # --no-deps: timm declares "
+            "torch/torchvision as hard dependencies; see the comment on "
+            "check_nanosam_runtime",
+            fix_action=install_timm,
+        )
+        return
+    except ImportError as exc:
+        bad(
+            "nanosam.mobile_sam import failed",
+            str(exc).splitlines()[0],
+            fix_action=install_timm,
+        )
+        return
+    ok("timm", "nanosam.mobile_sam.sam_model_registry importable")
+
+
 def install_onnx() -> bool:
     # No --no-deps: onnx doesn't declare torch, so there's nothing here for
     # --no-deps to protect against. Its numpy>=1.23.2 is already satisfied
@@ -779,6 +843,7 @@ CHECKS = (
     check_tensorrt,
     check_models,
     check_nanoowl_runtime,
+    check_nanosam_runtime,
     check_torch2trt,
     check_onnx_export,
     check_artifacts,
