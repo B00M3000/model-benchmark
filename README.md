@@ -107,18 +107,35 @@ python3 -m venv .venv --system-site-packages   # inherit JetPack's torch/TensorR
 `--system-site-packages` matters: the Jetson's `torch`, `torchvision` and
 `tensorrt` come from JetPack and must not be replaced by pip wheels.
 
-Then install the three model repos against that same environment:
+Then install the three model repos against that same environment. **Always pass
+`--no-deps`** — all three declare `torch` as a dependency, and pip will happily
+pull an aarch64 PyPI wheel over JetPack's build, which then fails at runtime
+with *"The NVIDIA driver on your system is too old"*:
 
 ```bash
-# NanoOWL
-git clone https://github.com/NVIDIA-AI-IOT/nanoowl && .venv/bin/pip install -e nanoowl
+git clone https://github.com/NVIDIA-AI-IOT/nanoowl
+git clone https://github.com/NVIDIA-AI-IOT/nanosam
+git clone https://github.com/mit-han-lab/efficientvit
 
-# NanoSAM
-git clone https://github.com/NVIDIA-AI-IOT/nanosam && .venv/bin/pip install -e nanosam
-
-# EfficientViT
-git clone https://github.com/mit-han-lab/efficientvit && .venv/bin/pip install -e efficientvit
+.venv/bin/pip install -e nanoowl     --no-deps
+.venv/bin/pip install -e nanosam     --no-deps
+.venv/bin/pip install -e efficientvit --no-deps
 ```
+
+`--no-deps` means their other requirements (`transformers`, `timm`, …) aren't
+installed automatically — add those individually as the import errors name them.
+That is the trade worth making: a broken torch is far more painful to unpick
+than a missing pure-Python package.
+
+Check the environment at any point:
+
+```bash
+.venv/bin/python scripts/doctor.py
+```
+
+It verifies torch is the JetPack build and matches the driver, that TensorRT and
+`trtexec` are present, that all three model packages import, which weights and
+engines exist, and whether the clocks are pinned — each with the fix.
 
 Build the TensorRT engines and fetch weights (once, on the Orin — engines are
 tied to the exact TensorRT version and GPU that built them and cannot be copied
@@ -127,6 +144,28 @@ between machines):
 ```bash
 ./scripts/build_engines.sh
 ```
+
+### "The NVIDIA driver on your system is too old (found version 12060)"
+
+The torch being imported was built against a newer CUDA than the Jetson driver
+provides — `12060` means the driver supports CUDA 12.6. It is almost always a
+PyPI torch wheel that has replaced the JetPack build. Confirm with:
+
+```bash
+python3 -c "import torch; print(torch.__version__, torch.version.cuda, torch.__file__)"
+```
+
+JetPack wheels carry an `.nv` suffix (`2.5.0a0+872d972e41.nv24.08`). A bare
+`2.6.0` or `2.6.0+cu128` is a PyPI wheel and is the problem. Reinstall the
+matched pair for your JetPack — for JetPack 6.x / CUDA 12.6:
+
+```bash
+pip install --no-cache-dir --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision
+```
+
+`torch` and `torchvision` must come from the same index; a mismatched pair fails
+at import. Then reinstall the model repos with `--no-deps` so pip cannot replace
+torch again.
 
 ### If `pip install -e` fails
 

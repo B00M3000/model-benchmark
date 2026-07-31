@@ -20,6 +20,30 @@ if ! have trtexec; then
   export PATH="/usr/src/tensorrt/bin:$PATH"
 fi
 
+PYTHON="${PYTHON:-python3}"
+if [[ -x .venv/bin/python ]]; then
+  PYTHON=.venv/bin/python
+fi
+
+# Preflight. Engine builds take minutes and load torch on the way in, so a
+# broken CUDA/torch pairing is worth catching now rather than three steps
+# from here. SKIP_DOCTOR=1 bypasses it.
+if [[ "${SKIP_DOCTOR:-0}" != "1" ]]; then
+  if ! "$PYTHON" scripts/doctor.py; then
+    cat <<'EOF'
+
+Preflight found problems that will break the engine build.
+Fix them, or re-run with SKIP_DOCTOR=1 to proceed anyway.
+
+Missing weights and engines are expected on a first run -- this script
+creates them. Problems with torch, CUDA or TensorRT are not, and will
+cause the build below to fail.
+EOF
+    read -r -p "Continue anyway? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || exit 1
+  fi
+fi
+
 # ── NanoOWL: OWL-ViT image encoder ────────────────────────────────────────
 if [[ -f "$DATA_DIR/owl_image_encoder_patch32.engine" ]]; then
   log "NanoOWL engine already present, skipping"
