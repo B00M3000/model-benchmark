@@ -58,11 +58,20 @@ class RequiredModule:
     repo: str
     why: str
     editable: bool = True
+    # torch2trt's setup.py does `import tensorrt` and `import torch` at module
+    # level to compile a CUDA extension. pip's PEP 517 build isolation builds
+    # in a throwaway env containing only declared build-requires -- it does
+    # NOT inherit the outer venv's --system-site-packages -- so that isolated
+    # env has neither, and the build fails with "No module named 'tensorrt'"
+    # despite both being importable everywhere else. --no-build-isolation
+    # makes it build with the current environment instead.
+    build_isolation: bool = True
 
     @property
     def install_hint(self) -> str:
         flag = "-e " if self.editable else ""
-        return f"git clone {self.repo} && pip install {flag}./{self.module} --no-deps"
+        iso = "" if self.build_isolation else " --no-build-isolation"
+        return f"git clone {self.repo} && pip install {flag}./{self.module} --no-deps{iso}"
 
 
 # --no-deps on every one of these: all four declare torch (and torch2trt
@@ -92,6 +101,7 @@ REQUIRED_MODULES: tuple[RequiredModule, ...] = (
         repo="https://github.com/NVIDIA-AI-IOT/torch2trt",
         why="runs the TensorRT engines for NanoOWL and NanoSAM",
         editable=False,
+        build_isolation=False,
     ),
 )
 

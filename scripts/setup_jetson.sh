@@ -9,6 +9,13 @@
 # -- which is what produces "The NVIDIA driver on your system is too old" and
 # "operator torchvision::nms does not exist".
 #
+# The package list, editable flag and build-isolation setting all come from
+# benchmark.models.registry.REQUIRED_MODULES rather than being duplicated
+# here, so there is exactly one place that knows torch2trt needs
+# --no-build-isolation (its setup.py imports tensorrt/torch to compile a CUDA
+# extension, and pip's isolated build env doesn't inherit
+# --system-site-packages, so it can't see either).
+#
 # If an install fails (JetPack's setuptools and packaging often disagree, which
 # breaks editable installs), the clone still works: this script prints the
 # repo_paths block to paste into config.yaml, and the app imports straight from
@@ -33,18 +40,36 @@ if [[ "$($PYTHON -c 'import sys; print(sys.prefix != sys.base_prefix)')" != "Tru
   warn "Create one with:  python3 -m venv .venv --system-site-packages"
 fi
 
-# name|git url|editable
-REPOS=(
-  "nanoowl|https://github.com/NVIDIA-AI-IOT/nanoowl|yes"
-  "nanosam|https://github.com/NVIDIA-AI-IOT/nanosam|yes"
-  "efficientvit|https://github.com/mit-han-lab/efficientvit|yes"
-  "torch2trt|https://github.com/NVIDIA-AI-IOT/torch2trt|no"
-)
+# NOT a plain `import $name` check. Every clone here is a directory that
+# shares its name with the package nested one level inside it
+# (nanosam/nanosam/__init__.py), so with the repo root on sys.path -- which
+# it always is here -- `import nanosam` "succeeds" as an empty PEP 420
+# namespace package even when nothing is actually installed. That false
+# positive previously made this script skip real installs entirely.
+# module_status() tells a genuine install apart from that shadow by checking
+# spec.origin (None for a namespace package).
+is_really_importable() {
+  "$PYTHON" - "$1" <<PYEOF
+import sys
+sys.path.insert(0, "$REPO_ROOT")
+from benchmark.models.registry import module_status
+status, _ = module_status(sys.argv[1])
+sys.exit(0 if status == "ok" else 1)
+PYEOF
+}
+
+MODULES_TSV="$("$PYTHON" - <<PYEOF
+import sys
+sys.path.insert(0, "$REPO_ROOT")
+from benchmark.models.registry import REQUIRED_MODULES
+for m in REQUIRED_MODULES:
+    print(f"{m.module}\t{m.repo}\t{int(m.editable)}\t{int(m.build_isolation)}")
+PYEOF
+)"
 
 NEEDS_REPO_PATHS=()
 
-for entry in "${REPOS[@]}"; do
-  IFS='|' read -r name url editable <<<"$entry"
+while IFS=$'\t' read -r name url editable build_iso; do
   dest="$SRC_DIR/$name"
 
   log "$name"
@@ -57,24 +82,24 @@ for entry in "${REPOS[@]}"; do
     }
   fi
 
-  if "$PYTHON" -c "import $name" >/dev/null 2>&1; then
+  if is_really_importable "$name"; then
     ok "already importable"
     continue
   fi
 
-  if [[ "$editable" == "yes" ]]; then
-    "$PYTHON" -m pip install -e "$dest" --no-deps
-  else
-    "$PYTHON" -m pip install "$dest" --no-deps
-  fi
+  args=(-m pip install)
+  [[ "$editable" == "1" ]] && args+=(-e)
+  args+=("$dest" --no-deps)
+  [[ "$build_iso" == "0" ]] && args+=(--no-build-isolation)
+  "$PYTHON" "${args[@]}"
 
-  if "$PYTHON" -c "import $name" >/dev/null 2>&1; then
+  if is_really_importable "$name"; then
     ok "installed"
   else
     warn "install did not take — will import from the clone instead"
     NEEDS_REPO_PATHS+=("$dest")
   fi
-done
+done <<<"$MODULES_TSV"
 
 if (( ${#NEEDS_REPO_PATHS[@]} )); then
   cat <<EOF

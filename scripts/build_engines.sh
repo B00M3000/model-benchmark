@@ -16,6 +16,29 @@ mkdir -p "$DATA_DIR"
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# NOT a plain `import $1` check. This script's cwd is the repo root, which
+# contains clone directories (nanosam/, torch2trt/, ...) sharing their name
+# with the package one level inside them -- so a naive import can silently
+# "succeed" against an empty PEP 420 namespace package instead of the real,
+# pip-installed one. module_status() (benchmark/models/registry.py) tells
+# them apart via spec.origin. See scripts/setup_jetson.sh for the fuller
+# writeup of this exact failure mode.
+require_importable() {
+  local module="$1" hint="$2"
+  if ! "$PYTHON" - "$module" <<PYEOF
+import sys
+sys.path.insert(0, ".")
+from benchmark.models.registry import module_status
+status, _ = module_status(sys.argv[1])
+sys.exit(0 if status == "ok" else 1)
+PYEOF
+  then
+    printf '\n%s is not really installed (only its clone directory is on sys.path,\nwhich resolves as an empty namespace package -- see the comment above).\n%s\n' \
+      "$module" "$hint" >&2
+    exit 1
+  fi
+}
+
 if ! have trtexec; then
   export PATH="/usr/src/tensorrt/bin:$PATH"
 fi
@@ -47,24 +70,13 @@ fi
 # NanoOWL's builder loads the finished engine back through torch2trt as its
 # last step, so a missing torch2trt wastes the whole build before failing.
 # Check it up front.
-if ! "$PYTHON" -c 'import torch2trt' >/dev/null 2>&1; then
-  cat <<'EOF'
-
-torch2trt is not installed, and the engine build needs it.
-
-NanoOWL and NanoSAM both run their TensorRT engines through torch2trt's
-TRTModule, but neither declares it as a dependency and it is not on PyPI.
-
-    ./scripts/setup_jetson.sh          # installs it along with the model repos
-
+require_importable torch2trt \
+  "./scripts/setup_jetson.sh          # installs it along with the model repos
 or by hand:
-
     git clone https://github.com/NVIDIA-AI-IOT/torch2trt
-    pip install ./torch2trt --no-deps
-
-EOF
-  exit 1
-fi
+    pip install ./torch2trt --no-deps --no-build-isolation
+(--no-build-isolation: its setup.py imports tensorrt/torch to compile a CUDA
+extension, and pip's isolated build env doesn't inherit --system-site-packages)"
 
 # ── NanoOWL: OWL-ViT image encoder ────────────────────────────────────────
 if [[ -f "$DATA_DIR/owl_image_encoder_patch32.engine" ]]; then
@@ -125,6 +137,11 @@ else
         -o "$DATA_DIR/mobile_sam.pt" \
         "https://raw.githubusercontent.com/NVIDIA-AI-IOT/nanosam/main/assets/mobile_sam.pt"
     fi
+    require_importable nanosam \
+      "./scripts/setup_jetson.sh          # installs it along with the other model repos
+or by hand:
+    git clone https://github.com/NVIDIA-AI-IOT/nanosam
+    pip install ./nanosam --no-deps"
     log "Exporting NanoSAM mask decoder to ONNX"
     "$PYTHON" -m nanosam.tools.export_sam_mask_decoder_onnx \
       --checkpoint="$DATA_DIR/mobile_sam.pt" \

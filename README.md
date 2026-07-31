@@ -136,7 +136,7 @@ git clone https://github.com/NVIDIA-AI-IOT/torch2trt
 .venv/bin/pip install -e nanoowl      --no-deps
 .venv/bin/pip install -e nanosam      --no-deps
 .venv/bin/pip install -e efficientvit --no-deps
-.venv/bin/pip install    torch2trt    --no-deps
+.venv/bin/pip install    ./torch2trt  --no-deps --no-build-isolation
 ```
 
 **`torch2trt` is easy to miss.** It is not on PyPI and neither NanoOWL nor
@@ -187,8 +187,18 @@ on PyPI and neither repo declares it, so a clean install lacks it.
 
 ```bash
 git clone https://github.com/NVIDIA-AI-IOT/torch2trt
-.venv/bin/pip install ./torch2trt --no-deps
+.venv/bin/pip install ./torch2trt --no-deps --no-build-isolation
 ```
+
+**`--no-build-isolation` is required, not optional, for this one.** torch2trt's
+`setup.py` does `import tensorrt` and `import torch` at the top level to compile
+a CUDA extension. pip's normal isolated build environment contains only
+declared build requirements — it does *not* inherit the outer venv's
+`--system-site-packages` — so even though both packages are importable
+everywhere else, the isolated build can't see either and fails with
+`ModuleNotFoundError: No module named 'tensorrt'` during "Getting requirements
+to build wheel". `--no-build-isolation` builds against the current environment
+instead, where both are already present.
 
 `--no-deps` matters here too — torch2trt declares `tensorrt`, and pip would
 install the PyPI wheel over JetPack's.
@@ -201,6 +211,32 @@ existing engine file and moves on.
 On TensorRT 10 (JetPack 6), install torch2trt from master rather than a release:
 older releases drive engines through the removed binding API and fail at
 inference with `no attribute 'num_bindings'`. The doctor flags this.
+
+### "No module named 'nanosam.tools'" (or any `<pkg>.<submodule>` after a supposedly clean install)
+
+```
+python: Error while finding module specification for
+'nanosam.tools.export_sam_mask_decoder_onnx' (ModuleNotFoundError: No module
+named 'nanosam.tools')
+```
+
+Every model repo here is a clone whose root directory shares its name with the
+package nested one level inside it — `nanosam/nanosam/__init__.py`. Run from
+the repo root (which `setup_jetson.sh` and `build_engines.sh` both do), a plain
+`import nanosam` can resolve to the *clone root* as an empty namespace package
+(PEP 420) instead of erroring — Python reports success, but nothing real is in
+it, so `nanosam.tools` doesn't exist even though `import nanosam` "worked".
+This previously made `setup_jetson.sh` believe packages were already installed
+and skip installing them for real.
+
+Both scripts now check with `benchmark.models.registry.module_status()`
+instead, which tells a genuine install apart from this by checking
+`spec.origin` (`None` for a namespace package). If you hit this outside those
+scripts, the fix is the same either way — actually install the package:
+
+```bash
+.venv/bin/pip install -e nanosam --no-deps
+```
 
 ### "Numpy is not available" / "compiled using NumPy 1.x cannot be run in NumPy 2"
 

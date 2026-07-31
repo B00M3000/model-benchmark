@@ -496,6 +496,8 @@ def install_module(required, origin: str):
         if required.editable:
             args.append("-e")
         args += [str(clone), "--no-deps"]
+        if not required.build_isolation:
+            args.append("--no-build-isolation")
         return run_fix(f"install {required.module}", args)
 
     return run
