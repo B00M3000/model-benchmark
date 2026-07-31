@@ -73,16 +73,43 @@ def fmt_cuda(version: int) -> str:
     return f"{version // 1000}.{(version % 1000) // 10}"
 
 
+def jetson_identity() -> tuple[str, str]:
+    """(board model, L4T release), either possibly empty.
+
+    /etc/nv_tegra_release is the usual marker but is absent from some flashed
+    and containerised images, so fall back to the device tree -- a Jetson
+    always reports its board there.
+    """
+    model = ""
+    try:
+        raw = Path("/proc/device-tree/model").read_bytes()
+        candidate = raw.decode("utf-8", "ignore").strip("\x00 \n")
+        if "jetson" in candidate.lower() or "tegra" in candidate.lower():
+            model = candidate
+    except OSError:
+        pass
+
+    release = ""
+    try:
+        release = Path("/etc/nv_tegra_release").read_text().strip().splitlines()[0]
+    except (OSError, IndexError):
+        pass
+
+    if not model and not release and Path("/etc/nv_boot_control.conf").exists():
+        model = "Tegra"
+    return model, release
+
+
 def check_platform() -> None:
     section("Platform")
     import platform
 
     machine = platform.machine()
-    l4t = Path("/etc/nv_tegra_release")
-    if l4t.exists():
-        ok("Jetson (L4T)", l4t.read_text().strip().splitlines()[0])
+    model, release = jetson_identity()
+    if model or release:
+        ok("Jetson", "  ".join(part for part in (model, release) if part))
     elif machine == "aarch64":
-        warn("aarch64 but no /etc/nv_tegra_release", "not a JetPack image?")
+        warn("aarch64, but no Jetson markers found", "not a JetPack image?")
     else:
         warn(f"Not a Jetson ({machine})", "mock backends only; numbers will be synthetic")
 
@@ -92,6 +119,25 @@ def check_platform() -> None:
             "Not running inside the venv",
             fix="source .venv/bin/activate  (or use .venv/bin/python)",
         )
+
+
+def parse_cuda(text: str | None) -> tuple[int, int] | None:
+    """'12.6' -> (12, 6). None when torch is a CPU build."""
+    if not text:
+        return None
+    parts = text.split(".")
+    try:
+        return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return None
+
+
+JETSON_TORCH_FIX = (
+    "Install a Jetson-matched build instead, e.g. for JetPack 6.x / CUDA 12.6:\n    "
+    "  pip install --no-cache-dir --index-url "
+    "https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision\n    "
+    "Then install the model repos with --no-deps so pip cannot replace it again."
+)
 
 
 def check_torch() -> None:
@@ -115,7 +161,6 @@ def check_torch() -> None:
 
     version = torch.__version__
     built_for = torch.version.cuda
-    is_jetpack_build = ".nv" in version or "tegra" in version.lower()
 
     ok("torch", f"{version}  (built for CUDA {built_for})  {torch.__file__}")
 
@@ -123,11 +168,19 @@ def check_torch() -> None:
     # breaks NanoOWL regardless of whether CUDA works.
     check_numpy(torch)
 
-    if not is_jetpack_build and driver is not None:
+    # Compare what torch was built against with what the driver supports.
+    # This is the condition that actually produces "The NVIDIA driver on your
+    # system is too old"; the wheel's filename or version suffix is not, since
+    # working Jetson wheels are published without one.
+    built = parse_cuda(built_for)
+    if built is not None and driver is not None and built > (
+        driver // 1000,
+        (driver % 1000) // 10,
+    ):
         warn(
-            "This does not look like a JetPack build of torch",
-            "JetPack wheels carry an .nv suffix, e.g. 2.5.0a0+872d972e41.nv24.08",
-            "A PyPI torch wheel will not match the Jetson driver -- see below.",
+            "torch is built for a newer CUDA than the driver supports",
+            f"torch wants CUDA {built_for}, driver supports {fmt_cuda(driver)}",
+            "This is a PyPI wheel, not a Jetson one. " + JETSON_TORCH_FIX,
         )
 
     # The decisive check. Catch rather than crash: a driver mismatch raises
@@ -139,11 +192,7 @@ def check_torch() -> None:
         if "too old" in message:
             hint = (
                 f"torch was built for CUDA {built_for} but the driver only supports "
-                f"CUDA {fmt_cuda(driver)}.\n    "
-                "Reinstall the JetPack-matched wheel, e.g. for JetPack 6.x / CUDA 12.6:\n    "
-                "  pip install --no-cache-dir --index-url "
-                "https://pypi.jetson-ai-lab.dev/jp6/cu126 torch torchvision\n    "
-                "Then install the model repos with --no-deps so pip cannot replace it again."
+                f"CUDA {fmt_cuda(driver) if driver else '?'}.\n    " + JETSON_TORCH_FIX
             )
         else:
             hint = message
@@ -309,10 +358,14 @@ def check_tensorrt() -> None:
         )
 
 
+# Modules that get a dedicated, deeper section below.
+DETAILED_CHECKS = {"torch2trt"}
+
+
 def check_models() -> None:
     section("Model packages")
     from benchmark.config import load_config
-    from benchmark.models.registry import JETSON_MODULES, ensure_repo_paths
+    from benchmark.models.registry import REQUIRED_MODULES, ensure_repo_paths
 
     config = load_config()
     added = ensure_repo_paths(config)
@@ -321,20 +374,86 @@ def check_models() -> None:
 
     import importlib.util
 
-    for module in JETSON_MODULES:
+    for required in REQUIRED_MODULES:
+        if required.module in DETAILED_CHECKS:
+            continue  # reported by its own section, in more detail
         try:
-            spec = importlib.util.find_spec(module)
+            spec = importlib.util.find_spec(required.module)
         except (ImportError, ValueError):
             spec = None
         if spec is not None:
-            ok(module, spec.origin or "")
+            ok(required.module, spec.origin or "")
         else:
             bad(
-                module,
-                "not importable",
-                f"pip install -e ../{module} --no-deps   "
-                f"(or add its clone to repo_paths in config.yaml)",
+                required.module,
+                f"not importable — {required.why}",
+                f"{required.install_hint}\n    "
+                "(or add the clone to repo_paths in config.yaml)",
             )
+
+
+def check_torch2trt() -> None:
+    """torch2trt is what actually executes the .engine files.
+
+    NanoOWL and NanoSAM both do ``from torch2trt import TRTModule`` to wrap an
+    engine as an nn.Module, but neither declares torch2trt as a dependency and
+    it is not on PyPI -- so a clean install silently lacks it, and the gap only
+    surfaces at the very end of the NanoOWL engine build.
+    """
+    section("torch2trt")
+    try:
+        import torch2trt
+    except ImportError:
+        bad(
+            "torch2trt not importable",
+            "NanoOWL and NanoSAM both need it to run their TensorRT engines",
+            "git clone https://github.com/NVIDIA-AI-IOT/torch2trt\n    "
+            "pip install ./torch2trt --no-deps      # --no-deps: it pulls in tensorrt",
+        )
+        return
+    except Exception as exc:
+        bad("torch2trt failed to import", f"{type(exc).__name__}: {exc}")
+        return
+
+    ok("torch2trt", getattr(torch2trt, "__file__", "") or "")
+
+    try:
+        from torch2trt import TRTModule
+    except ImportError:
+        bad(
+            "torch2trt.TRTModule missing",
+            "installed torch2trt is too old or partially built",
+            "Reinstall from master: pip install --force-reinstall --no-deps "
+            "./torch2trt",
+        )
+        return
+
+    # torch2trt releases predating TensorRT 10 drive engines through the
+    # removed binding API, so they import cleanly and then fail at inference
+    # with "no attribute 'num_bindings'". Detect that before a benchmark run
+    # rather than during one.
+    try:
+        import inspect
+
+        import tensorrt
+
+        trt_major = int(tensorrt.__version__.split(".")[0])
+        source = inspect.getsource(TRTModule)
+        uses_trt10_api = "num_io_tensors" in source or "get_tensor_name" in source
+        if trt_major >= 10 and not uses_trt10_api:
+            warn(
+                "torch2trt looks too old for TensorRT 10",
+                f"TensorRT {tensorrt.__version__}, but TRTModule still uses the "
+                "removed binding API",
+                "Install torch2trt from master:\n    "
+                "  pip install --force-reinstall --no-deps "
+                "git+https://github.com/NVIDIA-AI-IOT/torch2trt",
+            )
+        else:
+            ok("TRTModule", f"compatible with TensorRT {tensorrt.__version__}")
+    except Exception:
+        # Version probing is best-effort; the import above is the real check.
+        ok("TRTModule", "importable")
 
 
 def check_artifacts() -> None:
@@ -363,12 +482,23 @@ def check_artifacts() -> None:
 
 def check_clocks() -> None:
     section("Benchmark hygiene")
+    # nvpmodel lives in /usr/sbin, which is not on a normal user's PATH.
+    from shutil import which
+
+    nvpmodel = which("nvpmodel") or next(
+        (p for p in ("/usr/sbin/nvpmodel", "/usr/bin/nvpmodel") if os.path.exists(p)),
+        None,
+    )
+    if nvpmodel is None:
+        warn("nvpmodel not found", "not a Jetson?")
+        return
+
     try:
         out = subprocess.run(
-            ["nvpmodel", "-q"], capture_output=True, text=True, timeout=5
+            [nvpmodel, "-q"], capture_output=True, text=True, timeout=5
         ).stdout.strip()
-    except Exception:
-        warn("nvpmodel not available", "not a Jetson, or not on PATH")
+    except Exception as exc:
+        warn("nvpmodel could not be queried", f"{type(exc).__name__}: {exc}")
         return
 
     # `nvpmodel -q` prints the mode name then the mode number, e.g.
@@ -395,6 +525,7 @@ def main() -> int:
         check_opencv,
         check_tensorrt,
         check_models,
+        check_torch2trt,
         check_artifacts,
         check_clocks,
     ):

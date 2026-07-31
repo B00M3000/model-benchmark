@@ -17,6 +17,11 @@
 #                        The PyPI wheel is CPU-only, lacks the hardware
 #                        decoders, and requires NumPy 2 (see below).
 #
+# The model packages are not here either -- they are git checkouts, not PyPI
+# releases. Install them with ./scripts/setup_jetson.sh, which includes
+# torch2trt: NanoOWL and NanoSAM both need it to run their TensorRT engines
+# but neither declares it as a dependency.
+#
 # Verify the result with: python3 scripts/doctor.py
 
 fastapi>=0.110

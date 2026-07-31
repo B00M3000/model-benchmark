@@ -119,25 +119,41 @@ Two constraints follow, and both cause failures far from their cause:
   PyPI wheel is CPU-only, lacks the hardware decoders, and 4.11+ requires
   NumPy 2, which reintroduces the problem above.
 
-Then install the three model repos against that same environment. **Always pass
-`--no-deps`** — all three declare `torch` as a dependency, and pip will happily
-pull an aarch64 PyPI wheel over JetPack's build, which then fails at runtime
-with *"The NVIDIA driver on your system is too old"*:
+Then install the four model packages against that same environment:
+
+```bash
+./scripts/setup_jetson.sh
+```
+
+That clones and installs them, then runs the doctor. By hand it is:
 
 ```bash
 git clone https://github.com/NVIDIA-AI-IOT/nanoowl
 git clone https://github.com/NVIDIA-AI-IOT/nanosam
 git clone https://github.com/mit-han-lab/efficientvit
+git clone https://github.com/NVIDIA-AI-IOT/torch2trt
 
-.venv/bin/pip install -e nanoowl     --no-deps
-.venv/bin/pip install -e nanosam     --no-deps
+.venv/bin/pip install -e nanoowl      --no-deps
+.venv/bin/pip install -e nanosam      --no-deps
 .venv/bin/pip install -e efficientvit --no-deps
+.venv/bin/pip install    torch2trt    --no-deps
 ```
 
-`--no-deps` means their other requirements (`transformers`, `timm`, …) aren't
-installed automatically — add those individually as the import errors name them.
-That is the trade worth making: a broken torch is far more painful to unpick
-than a missing pure-Python package.
+**`torch2trt` is easy to miss.** It is not on PyPI and neither NanoOWL nor
+NanoSAM declares it, so nothing installs it as a side effect — but both do
+`from torch2trt import TRTModule` to execute their TensorRT engines. Without it
+the NanoOWL engine build runs to completion and then fails on its last line,
+loading the finished engine back (`ModuleNotFoundError: No module named
+'torch2trt'`). The engine it just built is fine; only the verification step
+failed.
+
+**Always pass `--no-deps`.** All four declare `torch` as a dependency (torch2trt
+also declares `tensorrt`), and pip will happily pull a PyPI wheel over JetPack's
+build, which then fails at runtime with *"The NVIDIA driver on your system is
+too old"*. The cost is that their other requirements (`transformers`, `timm`, …)
+aren't installed automatically — add those individually as the import errors
+name them. That trade is worth making: a broken torch is far more painful to
+unpick than a missing pure-Python package.
 
 Check the environment at any point:
 
@@ -145,9 +161,10 @@ Check the environment at any point:
 .venv/bin/python scripts/doctor.py
 ```
 
-It verifies torch is the JetPack build and matches the driver, that TensorRT and
-`trtexec` are present, that all three model packages import, which weights and
-engines exist, and whether the clocks are pinned — each with the fix.
+It verifies torch matches the driver's CUDA version and can convert NumPy
+arrays, that TensorRT and `trtexec` are present, that all four packages import,
+that torch2trt's `TRTModule` is new enough for the installed TensorRT, which
+weights and engines exist, and whether the clocks are pinned — each with the fix.
 
 Build the TensorRT engines and fetch weights (once, on the Orin — engines are
 tied to the exact TensorRT version and GPU that built them and cannot be copied
@@ -156,6 +173,34 @@ between machines):
 ```bash
 ./scripts/build_engines.sh
 ```
+
+### "No module named 'torch2trt'"
+
+```
+File "nanoowl/owl_predictor.py", line 383, in load_image_encoder_engine
+    from torch2trt import TRTModule
+ModuleNotFoundError: No module named 'torch2trt'
+```
+
+torch2trt executes the TensorRT engines for both NanoOWL and NanoSAM. It is not
+on PyPI and neither repo declares it, so a clean install lacks it.
+
+```bash
+git clone https://github.com/NVIDIA-AI-IOT/torch2trt
+.venv/bin/pip install ./torch2trt --no-deps
+```
+
+`--no-deps` matters here too — torch2trt declares `tensorrt`, and pip would
+install the PyPI wheel over JetPack's.
+
+If this appeared at the end of `build_engines.sh`, **the engine built
+successfully**; the failure is in the step that loads it back to verify.
+Installing torch2trt and re-running skips straight past it — the script sees the
+existing engine file and moves on.
+
+On TensorRT 10 (JetPack 6), install torch2trt from master rather than a release:
+older releases drive engines through the removed binding API and fail at
+inference with `no attribute 'num_bindings'`. The doctor flags this.
 
 ### "Numpy is not available" / "compiled using NumPy 1.x cannot be run in NumPy 2"
 

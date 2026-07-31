@@ -52,7 +52,52 @@ PAIRINGS: tuple[Pairing, ...] = (
 PAIRING_BY_ID = {p.pairing_id: p for p in PAIRINGS}
 
 
-JETSON_MODULES = ("nanoowl", "nanosam", "efficientvit")
+@dataclass(frozen=True)
+class RequiredModule:
+    module: str
+    repo: str
+    why: str
+    editable: bool = True
+
+    @property
+    def install_hint(self) -> str:
+        flag = "-e " if self.editable else ""
+        return f"git clone {self.repo} && pip install {flag}./{self.module} --no-deps"
+
+
+# --no-deps on every one of these: all four declare torch (and torch2trt
+# declares tensorrt) as dependencies, and letting pip satisfy those replaces
+# JetPack's builds with PyPI wheels compiled for a different CUDA.
+REQUIRED_MODULES: tuple[RequiredModule, ...] = (
+    RequiredModule(
+        module="nanoowl",
+        repo="https://github.com/NVIDIA-AI-IOT/nanoowl",
+        why="the detector, shared by both pairings",
+    ),
+    RequiredModule(
+        module="nanosam",
+        repo="https://github.com/NVIDIA-AI-IOT/nanosam",
+        why="pairing A's segmentation head",
+    ),
+    RequiredModule(
+        module="efficientvit",
+        repo="https://github.com/mit-han-lab/efficientvit",
+        why="pairing B's segmentation head",
+    ),
+    # Not on PyPI, and neither nanoowl nor nanosam declares it -- so nothing
+    # installs it as a side effect. Both import TRTModule from it to run their
+    # TensorRT engines, so a missing torch2trt breaks both pairings.
+    RequiredModule(
+        module="torch2trt",
+        repo="https://github.com/NVIDIA-AI-IOT/torch2trt",
+        why="runs the TensorRT engines for NanoOWL and NanoSAM",
+        editable=False,
+    ),
+)
+
+MODULE_BY_NAME = {m.module: m for m in REQUIRED_MODULES}
+
+JETSON_MODULES = tuple(m.module for m in REQUIRED_MODULES)
 
 
 def ensure_repo_paths(config: AppConfig) -> list[str]:

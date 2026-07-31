@@ -44,12 +44,34 @@ EOF
   fi
 fi
 
+# NanoOWL's builder loads the finished engine back through torch2trt as its
+# last step, so a missing torch2trt wastes the whole build before failing.
+# Check it up front.
+if ! "$PYTHON" -c 'import torch2trt' >/dev/null 2>&1; then
+  cat <<'EOF'
+
+torch2trt is not installed, and the engine build needs it.
+
+NanoOWL and NanoSAM both run their TensorRT engines through torch2trt's
+TRTModule, but neither declares it as a dependency and it is not on PyPI.
+
+    ./scripts/setup_jetson.sh          # installs it along with the model repos
+
+or by hand:
+
+    git clone https://github.com/NVIDIA-AI-IOT/torch2trt
+    pip install ./torch2trt --no-deps
+
+EOF
+  exit 1
+fi
+
 # ── NanoOWL: OWL-ViT image encoder ────────────────────────────────────────
 if [[ -f "$DATA_DIR/owl_image_encoder_patch32.engine" ]]; then
   log "NanoOWL engine already present, skipping"
 else
   log "Building NanoOWL image encoder engine (several minutes)"
-  python3 -m nanoowl.build_image_encoder_engine \
+  "$PYTHON" -m nanoowl.build_image_encoder_engine \
     "$DATA_DIR/owl_image_encoder_patch32.engine"
 fi
 
