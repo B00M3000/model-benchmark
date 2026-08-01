@@ -193,9 +193,14 @@ or by hand:
     pip install ./nanosam --no-deps"
 
       # nanosam itself being installed doesn't mean its vendored MobileSAM
-      # does -- mobile_sam/modeling/tiny_vit_sam.py imports timm, which
-      # nanosam doesn't declare (installed with --no-deps, like the rest).
-      if ! "$PYTHON" -c 'from nanosam.mobile_sam import sam_model_registry' >/dev/null 2>&1; then
+      # does. Checked as two independent, direct imports rather than one
+      # `from nanosam.mobile_sam import sam_model_registry` -- that chain
+      # hits timm (via modeling/tiny_vit_sam.py) before pycocotools (via
+      # mobile_sam's own __init__.py unconditionally importing
+      # automatic_mask_generator.py), so a single combined check would
+      # misreport a missing pycocotools as a missing timm. Neither is
+      # declared by nanosam (installed with --no-deps, like the rest).
+      if ! "$PYTHON" -c 'import timm' >/dev/null 2>&1; then
         cat <<'EOF' >&2
 
 timm is not installed, and nanosam's vendored MobileSAM needs it
@@ -203,11 +208,27 @@ timm is not installed, and nanosam's vendored MobileSAM needs it
 
     pip install timm --no-deps
 
---no-deps matters here: unlike transformers/onnx, timm declares torch AND
-torchvision as hard dependencies, so a plain install risks replacing
-JetPack's build. timm's other dependencies (pyyaml, huggingface_hub,
-safetensors) are already installed via the transformers step, so nothing
-is lost by skipping them.
+--no-deps matters here: unlike most of this project's other runtime
+dependencies, timm declares torch AND torchvision as hard dependencies, so
+a plain install risks replacing JetPack's build. timm's other dependencies
+(pyyaml, huggingface_hub, safetensors) are already installed via the
+transformers step, so nothing is lost by skipping them.
+
+EOF
+        exit 1
+      fi
+      if ! "$PYTHON" -c 'import pycocotools' >/dev/null 2>&1; then
+        cat <<'EOF' >&2
+
+pycocotools is not installed. nanosam's vendored MobileSAM needs it too --
+mobile_sam/__init__.py unconditionally imports automatic_mask_generator.py,
+even though nothing this app uses ever calls automatic mask generation.
+
+    pip install pycocotools
+
+Not --no-deps: pycocotools doesn't depend on torch, so there's nothing here
+for --no-deps to protect against. Ships a real aarch64 wheel, not a
+from-source build.
 
 EOF
         exit 1

@@ -140,10 +140,7 @@ fi
 # NanoSAM's mask decoder does NOT need this: build_engines.sh fetches a
 # pre-built ONNX for it by default rather than exporting fresh, since a fresh
 # export reliably produces a graph trtexec rejects on a modern torch (see
-# the comment in build_engines.sh). timm -- needed only by that export path,
-# via nanosam's vendored MobileSAM -- is deliberately not installed here for
-# the same reason; install it by hand (pip install timm --no-deps) only if
-# you set NANOSAM_EXPORT_DECODER=1.
+# the comment in build_engines.sh).
 log "onnx (needed to build the NanoOWL engine)"
 if "$PYTHON" -c 'import onnx' >/dev/null 2>&1; then
   ok "already importable"
@@ -151,12 +148,19 @@ else
   "$PYTHON" -m pip install onnx
 fi
 
-# segment_anything is Meta's original SAM, not one of the four repos, but
-# efficientvit's own SAM predictor (models/efficientvit/sam.py) imports it
-# directly -- efficientvit's setup.py even declares it, as a git dependency,
-# which --no-deps (needed for efficientvit itself) skips. Not on PyPI under
-# a trustworthy name; installed from the source repo, same as torch2trt.
-# No --no-deps needed: its own setup.py declares zero dependencies.
+# Everything below is needed by EfficientViT-SAM's own runtime import chain
+# (efficientvit.models.efficientvit.sam), traced with a static AST analyzer
+# after manual, file-by-file tracing missed three of these in a row --
+# Python executes a package's __init__.py in full before any of its
+# submodules are usable, and efficientvit's own __init__.py files pull in
+# far more than the SAM predictor alone needs. None of these are declared by
+# efficientvit (installed with --no-deps above), and none need --no-deps
+# themselves -- none of them depend on torch.
+
+# segment_anything (Meta's original SAM): models/efficientvit/sam.py imports
+# it directly. efficientvit's setup.py even declares this, as a git
+# dependency -- exactly what --no-deps skips. Not on PyPI under a
+# trustworthy name; installed from the source repo, same as torch2trt.
 log "segment_anything (efficientvit's SAM predictor needs it)"
 if "$PYTHON" -c 'from segment_anything import SamAutomaticMaskGenerator' >/dev/null 2>&1; then
   ok "already importable"
@@ -164,16 +168,65 @@ else
   "$PYTHON" -m pip install "git+https://github.com/facebookresearch/segment-anything.git"
 fi
 
-# triton is OpenAI's GPU kernel compiler. Not obviously related to any of
-# this, but efficientvit.models.nn/__init__.py unconditionally does
+# pycocotools: segment_anything's OWN __init__.py unconditionally imports
+# automatic_mask_generator.py, which needs this -- even though nothing in
+# this app's actual usage (EfficientViTSamPredictor) ever calls automatic
+# mask generation. Ships a real aarch64 wheel; not a from-source build.
+log "pycocotools (segment_anything's own __init__.py pulls it in)"
+if "$PYTHON" -c 'import pycocotools' >/dev/null 2>&1; then
+  ok "already importable"
+else
+  "$PYTHON" -m pip install pycocotools
+fi
+
+# omegaconf: models/efficientvit/__init__.py unconditionally does
+# `from .dc_ae import *` alongside `from .sam import *` -- dc_ae.py imports
+# omegaconf at module level. Reached just by importing the SAM predictor's
+# own package, regardless of which model inside it is actually used.
+log "omegaconf (pulled in by models/efficientvit/__init__.py alongside sam.py)"
+if "$PYTHON" -c 'import omegaconf' >/dev/null 2>&1; then
+  ok "already importable"
+else
+  "$PYTHON" -m pip install omegaconf
+fi
+
+# onnxsim: models/nn/__init__.py -> drop.py -> apps.trainer.run_config ->
+# apps.trainer (package __init__) -> apps.trainer.base -> apps.utils
+# (package __init__) -> apps/utils/export.py, which does
+# `from onnxsim import simplify` at module level. Never actually called by
+# anything this app uses; only the import has to succeed.
+log "onnxsim (reached via models/nn -> apps.trainer -> apps.utils.export)"
+if "$PYTHON" -c 'import onnxsim' >/dev/null 2>&1; then
+  ok "already importable"
+else
+  "$PYTHON" -m pip install onnxsim
+fi
+
+# timm: continuing that same chain, apps.trainer.base also imports
+# efficientvit.apps.data_provider, whose own __init__.py pulls in
+# apps/data_provider/augment/color_aug.py, which does
+# `from timm.data.auto_augment import rand_augment_transform`. This is a
+# SEPARATE reason from NanoSAM's export script (which also needs timm, via
+# its own unrelated vendored-MobileSAM path, only under
+# NANOSAM_EXPORT_DECODER=1) -- efficientvit needs it unconditionally, for
+# its default runtime path. --no-deps matters here, unlike everything else
+# above: timm's pyproject.toml declares torch AND torchvision as hard,
+# unconstrained dependencies, so a plain install risks replacing JetPack's
+# build.
+log "timm (efficientvit's own color-augmentation module needs it)"
+if "$PYTHON" -c 'import timm' >/dev/null 2>&1; then
+  ok "already importable"
+else
+  "$PYTHON" -m pip install timm --no-deps
+fi
+
+# triton (OpenAI's GPU kernel compiler): models/nn/__init__.py also does
 # `from .norm import *`, and norm.py unconditionally imports
 # TritonRMSNorm2dFunc from triton_rms_norm.py -- so importing
-# efficientvit.models.nn AT ALL requires triton, even though the L0 SAM
+# efficientvit.models.nn at all requires triton, even though the L0 SAM
 # variant this project uses never actually selects triton-based
 # normalization (it uses plain batchnorm; norm="bn2d" in sam_model_zoo.py).
 # Only the import has to succeed, the kernel is never JIT-compiled or run.
-# No --no-deps needed: triton's only unconstrained dependency is
-# importlib-metadata, and only for Python < 3.10.
 log "triton (efficientvit.models.nn imports it unconditionally)"
 if "$PYTHON" -c 'import triton' >/dev/null 2>&1; then
   ok "already importable"

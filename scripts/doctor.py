@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -646,51 +648,128 @@ def check_nanosam_runtime() -> None:
     ok("timm", "nanosam.mobile_sam.sam_model_registry importable")
 
 
-def install_segment_anything() -> bool:
-    # Not on PyPI under a trustworthy name; installed from source, same as
-    # torch2trt. No --no-deps needed: its own setup.py declares zero deps.
-    return run_fix(
-        "install segment_anything (efficientvit's SAM predictor needs it)",
-        [sys.executable, "-m", "pip", "install",
-         "git+https://github.com/facebookresearch/segment-anything.git"],
-    )
+@dataclass(frozen=True)
+class RuntimeDep:
+    module: str
+    why: str
+    install_args: tuple[str, ...]  # passed to `pip install`, after the module name choice
+    package_arg: str | None = None  # pip install target, if different from `module`
+
+    @property
+    def pip_target(self) -> str:
+        return self.package_arg or self.module
+
+    @property
+    def install_hint(self) -> str:
+        return f"pip install {self.pip_target} " + " ".join(self.install_args)
 
 
-def install_triton() -> bool:
-    # No --no-deps: triton's only unconstrained dependency is
-    # importlib-metadata, and only for Python < 3.10.
-    return run_fix(
-        "install triton (efficientvit.models.nn imports it unconditionally)",
-        [sys.executable, "-m", "pip", "install", "triton"],
-    )
+# Every one of these is reached only as a side effect of importing
+# efficientvit.models.efficientvit.sam -- Python fully executes a package's
+# __init__.py (and every __init__.py of every ancestor package) before any
+# of its submodules are usable, and efficientvit's own __init__.py files
+# each pull in far more than the SAM predictor alone needs:
+#
+#   models/efficientvit/__init__.py -- alongside `from .sam import *`, also
+#     unconditionally does `from .dc_ae import *`, which imports omegaconf.
+#   models/nn/__init__.py -- does `from .drop import *` and `from .norm
+#     import *` unconditionally. .drop reaches apps.trainer.run_config,
+#     which (via apps/trainer/__init__.py's own `from .base import *`)
+#     reaches apps.trainer.base, which imports efficientvit.apps.data_provider
+#     -- whose __init__.py pulls in augment/color_aug.py (needs timm) -- and
+#     also imports efficientvit.apps.utils, whose __init__.py pulls in
+#     apps/utils/export.py (needs onnxsim). .norm reaches triton_rms_norm.py
+#     (needs triton) the same way.
+#   segment_anything/__init__.py (not efficientvit's own code, but pulled in
+#     by sam.py) unconditionally imports automatic_mask_generator.py, which
+#     needs pycocotools.
+#
+# Traced with a static AST analyzer after three rounds of manual, file-by-
+# file tracing each missed a different branch of this same tree. Checked
+# here as independent, direct imports of each leaf package rather than one
+# combined "does efficientvit.models.nn import" attempt -- a single combined
+# check only ever reveals whichever one is missing *first* in execution
+# order, misreporting every other gap as the wrong one when more than one
+# is absent at once. This is exactly what happened during development here:
+# a missing onnxsim was misreported as a missing triton, since drop.py (onnxsim)
+# runs before norm.py (triton) inside the same __init__.py.
+#
+# None of these are declared by efficientvit itself (installed with
+# --no-deps, like the other three repos). Only timm needs --no-deps of its
+# own: its pyproject.toml declares torch and torchvision as hard,
+# unconstrained dependencies, so a plain install risks replacing JetPack's
+# build. None of the other five depend on torch, so there's nothing for
+# --no-deps to protect against with them.
+EFFICIENTVIT_RUNTIME_DEPS: tuple[RuntimeDep, ...] = (
+    RuntimeDep(
+        module="segment_anything",
+        why="efficientvit's own SAM predictor imports it directly "
+        "(models/efficientvit/sam.py) -- efficientvit's setup.py even "
+        "declares this, as a git dependency, but that's exactly what "
+        "--no-deps skips",
+        install_args=(),
+        package_arg="git+https://github.com/facebookresearch/segment-anything.git",
+    ),
+    RuntimeDep(
+        module="pycocotools",
+        why="segment_anything's own __init__.py unconditionally imports "
+        "automatic_mask_generator.py, which needs this -- even though "
+        "nothing this app uses ever calls automatic mask generation",
+        install_args=(),
+    ),
+    RuntimeDep(
+        module="omegaconf",
+        why="models/efficientvit/__init__.py unconditionally does "
+        "`from .dc_ae import *` alongside `from .sam import *` -- dc_ae.py "
+        "imports omegaconf at module level",
+        install_args=(),
+    ),
+    RuntimeDep(
+        module="onnxsim",
+        why="reached via models/nn -> .drop -> apps.trainer -> "
+        "apps.utils.export, which does `from onnxsim import simplify` -- "
+        "never actually called by anything this app uses",
+        install_args=(),
+    ),
+    RuntimeDep(
+        module="timm",
+        why="continuing that same chain, apps.trainer.base imports "
+        "efficientvit.apps.data_provider, whose __init__.py pulls in "
+        "augment/color_aug.py, which imports timm.data.auto_augment. This "
+        "is a separate reason from NanoSAM's own, unrelated need for timm "
+        "(only under NANOSAM_EXPORT_DECODER=1) -- efficientvit needs it "
+        "unconditionally, on its default runtime path",
+        install_args=("--no-deps",),
+    ),
+    RuntimeDep(
+        module="triton",
+        why="models/nn/__init__.py also does `from .norm import *`, and "
+        "norm.py unconditionally imports TritonRMSNorm2dFunc from "
+        "triton_rms_norm.py, even though the L0 SAM variant this project "
+        "uses never actually selects triton-based normalization "
+        "(sam_model_zoo.py builds it with norm=\"bn2d\") -- only the "
+        "*import* has to succeed, the kernel is never JIT-compiled or run",
+        install_args=(),
+    ),
+)
+
+
+def install_runtime_dep(dep: RuntimeDep):
+    def run() -> bool:
+        return run_fix(
+            f"install {dep.module}",
+            [sys.executable, "-m", "pip", "install", dep.pip_target, *dep.install_args],
+        )
+
+    return run
 
 
 def check_efficientvit_runtime() -> None:
-    """EfficientViT-SAM's own predictor needs two packages nothing installs.
+    """Check every one of EfficientViT-SAM's real runtime dependencies.
 
-    Traced the full import graph from efficientvit.models.efficientvit.sam
-    and efficientvit.sam_model_zoo (the two entry points this app's
-    EfficientViTSamSegmenter actually uses) with a static analyzer rather
-    than guessing, after transformers/onnx/timm each turned out to be one
-    crash at a time. Two real gaps, found that way:
-
-    - `from segment_anything import SamAutomaticMaskGenerator` (sam.py).
-      Meta's original SAM. efficientvit's own setup.py even declares this,
-      as a git dependency -- but efficientvit is installed with --no-deps
-      (required, same reason as the other three repos), so nothing pulls it
-      in. Its own setup.py declares zero dependencies, so no --no-deps
-      concern installing it.
-
-    - `import triton` (models/nn/triton_rms_norm.py). Reached unconditionally:
-      models/nn/__init__.py does `from .norm import *`, and norm.py
-      unconditionally imports TritonRMSNorm2dFunc from triton_rms_norm.py --
-      so importing efficientvit.models.nn at all requires triton, even
-      though the L0 SAM variant this project uses never actually selects
-      triton-based normalization (sam_model_zoo.py builds it with
-      norm="bn2d"). Only the *import* has to succeed; the kernel itself is
-      never JIT-compiled or run for this model. triton publishes aarch64
-      manylinux wheels for cp310 (JetPack 6's Python), so this is a plain
-      pip install, not a build-from-source situation.
+    See the comment on EFFICIENTVIT_RUNTIME_DEPS for how these were found
+    and why each is checked independently rather than via one combined
+    import attempt.
 
     Skipped entirely if efficientvit itself isn't really installed --
     check_models() already reports that.
@@ -700,45 +779,38 @@ def check_efficientvit_runtime() -> None:
     if module_status("efficientvit")[0] != "ok":
         return
 
-    section("EfficientViT-SAM runtime (segment_anything, triton)")
-    try:
-        from segment_anything import SamAutomaticMaskGenerator  # noqa: F401
-    except ModuleNotFoundError as exc:
-        bad(
-            f"{exc.name} not importable",
-            "needed by efficientvit's own SAM predictor "
-            "(models/efficientvit/sam.py)",
-            "pip install git+https://github.com/facebookresearch/segment-anything.git",
-            fix_action=install_segment_anything,
-        )
-    except ImportError as exc:
-        bad(
-            "segment_anything import failed",
-            str(exc).splitlines()[0],
-            fix_action=install_segment_anything,
-        )
-    else:
-        ok("segment_anything", "SamAutomaticMaskGenerator importable")
+    section(
+        "EfficientViT-SAM runtime ("
+        + ", ".join(d.module for d in EFFICIENTVIT_RUNTIME_DEPS)
+        + ")"
+    )
+    for dep in EFFICIENTVIT_RUNTIME_DEPS:
+        try:
+            importlib.import_module(dep.module)
+        except ImportError as exc:
+            bad(
+                f"{dep.module} not importable",
+                dep.why,
+                dep.install_hint,
+                fix_action=install_runtime_dep(dep),
+            )
+        else:
+            ok(dep.module)
 
+    # Final, holistic confirmation: the independent checks above cover
+    # everything found so far, but a combined attempt at the real entry
+    # point catches anything this audit still missed, rather than reporting
+    # false confidence.
     try:
-        from efficientvit.models.nn.triton_rms_norm import TritonRMSNorm2dFunc  # noqa: F401
-    except ModuleNotFoundError as exc:
+        from efficientvit.models.efficientvit.sam import EfficientViTSamPredictor  # noqa: F401
+    except Exception as exc:
         bad(
-            f"{exc.name} not importable",
-            "efficientvit.models.nn imports it unconditionally "
-            "(models/nn/norm.py), even though the L0 SAM variant never "
-            "actually uses triton-based normalization",
-            "pip install triton",
-            fix_action=install_triton,
-        )
-    except ImportError as exc:
-        bad(
-            "efficientvit.models.nn import failed",
-            str(exc).splitlines()[0],
-            fix_action=install_triton,
+            "efficientvit.models.efficientvit.sam import failed",
+            f"{type(exc).__name__}: {str(exc).splitlines()[0]} -- unexpected; "
+            "not one of the dependencies above",
         )
     else:
-        ok("triton", "efficientvit.models.nn importable")
+        ok("efficientvit.models.efficientvit.sam", "EfficientViTSamPredictor importable")
 
 
 def install_onnx() -> bool:
