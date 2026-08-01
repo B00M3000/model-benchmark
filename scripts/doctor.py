@@ -994,6 +994,78 @@ def build_artifacts() -> bool:
         return False
 
 
+def install_ffmpeg() -> bool:
+    return run_fix(
+        "install ffmpeg (H.264 encoder for the comparison video)",
+        ["apt-get", "install", "-y", "ffmpeg"],
+        use_sudo=True,
+    )
+
+
+def opencv_can_write_h264() -> bool:
+    """Can this OpenCV build write H.264 itself?
+
+    Distro OpenCV usually links libx264 and can; the pip `opencv-python`
+    wheels ship without an H.264 encoder for licensing reasons and cannot.
+    VideoWriter.isOpened() is the reliable signal either way.
+    """
+    import tempfile
+
+    try:
+        import cv2
+    except ImportError:
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "probe.mp4")
+        try:
+            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"avc1"), 30.0, (64, 64))
+        except Exception:
+            return False
+        opened = writer.isOpened()
+        writer.release()
+        return bool(opened)
+
+
+def check_video_encoder() -> None:
+    """The comparison video has to be playable, not merely written.
+
+    OpenCV's default mp4v codec produces MPEG-4 Part 2: a valid .mp4 that
+    VLC plays and no browser can decode, with no error anywhere. Since the
+    video is viewed in the browser UI, a missing H.264 encoder makes the
+    deliverable silently useless -- worth catching here rather than after a
+    full benchmark run.
+    """
+    section("Comparison video encoder")
+    from shutil import which
+
+    try:
+        # Imported rather than reimplemented so the doctor probes for exactly
+        # the encoders the renderer will accept. Pulls in cv2, which
+        # check_opencv above has already reported on if it is missing.
+        from benchmark.video import _ffmpeg_h264_encoder
+    except ImportError as exc:
+        warn("Could not probe the video encoder", f"{type(exc).__name__}: {exc}")
+        return
+
+    binary = which("ffmpeg")
+    if binary:
+        encoder = _ffmpeg_h264_encoder(binary)
+        if encoder:
+            ok("ffmpeg", f"{binary}  (H.264 via {encoder})")
+            return
+        warn("ffmpeg has no H.264 encoder", f"{binary} — checked libx264 and the NVIDIA ones")
+    if opencv_can_write_h264():
+        ok("OpenCV avc1", "can write H.264 directly; ffmpeg not required")
+        return
+    bad(
+        "No H.264 encoder",
+        "the comparison video will be written as mp4v, which plays in VLC "
+        "but shows a blank player in any browser",
+        "sudo apt install ffmpeg",
+        fix_action=install_ffmpeg,
+    )
+
+
 def check_clocks() -> None:
     section("Benchmark hygiene")
     # nvpmodel lives in /usr/sbin, which is not on a normal user's PATH.
@@ -1053,6 +1125,7 @@ CHECKS = (
     check_torch2trt,
     check_onnx_export,
     check_artifacts,
+    check_video_encoder,
     check_clocks,
 )
 

@@ -132,6 +132,13 @@ def test_comparison_video_is_rendered(client, synthetic_video):
     assert response.status_code == 200
     assert len(response.content) > 0
 
+    # Which encoder ran is environment-dependent, but the job must always
+    # say, and must warn exactly when the codec is one browsers can't play
+    # -- otherwise an unopenable video looks like a successful render.
+    assert job["video_encoder"]
+    playable = b"avc1" in response.content
+    assert (job["video_note"] is None) is playable
+
 
 def test_websocket_streams_progress(client, synthetic_video):
     job_id = _submit(client, synthetic_video).json()["job_id"]

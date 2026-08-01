@@ -37,7 +37,7 @@ from .models.registry import (
 )
 from .pipeline import CancelledError, RunConfig, VideoInfo, probe_video, run_pairing
 from .storage import JobPaths, load_masks, read_json, read_jsonl, write_json
-from .video import COLOR_A, COLOR_B, PanelData, render_comparison
+from .video import COLOR_A, COLOR_B, PanelData, RenderResult, render_comparison
 
 # --- states -----------------------------------------------------------------
 QUEUED = "queued"
@@ -86,6 +86,11 @@ class Job:
     has_results: bool = False
     has_video: bool = False
     video_error: str | None = None
+    #: Which encoder produced the comparison video, e.g. ffmpeg/libx264.
+    video_encoder: str | None = None
+    #: Set when the video was written in a codec browsers cannot play,
+    #: so the UI can say so instead of showing an empty player.
+    video_note: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +112,8 @@ class Job:
             "has_results": self.has_results,
             "has_video": self.has_video,
             "video_error": self.video_error,
+            "video_encoder": self.video_encoder,
+            "video_note": self.video_note,
             "stage_sequence": list(STAGE_SEQUENCE),
             "is_terminal": self.state in TERMINAL_STATES,
         }
@@ -530,8 +537,15 @@ class JobManager:
 
         self._transition(job, RENDERING_VIDEO)
         try:
-            self._render_video(job, paths, info, run, summaries, cancel)
+            result = self._render_video(job, paths, info, run, summaries, cancel)
             job.has_video = True
+            job.video_encoder = result.encoder
+            if not result.browser_playable:
+                job.video_note = (
+                    f"Rendered with {result.encoder}, which browsers cannot play — the "
+                    "player above will stay blank. Download it and open it in VLC, or "
+                    "install ffmpeg on this machine and re-run to get H.264."
+                )
             job.finished_at = time.time()
             self._transition(job, COMPLETE)
         except Exception as exc:
@@ -623,7 +637,7 @@ class JobManager:
         run: RunConfig,
         summaries: dict[str, PairingSummary],
         cancel: threading.Event,
-    ) -> None:
+    ) -> RenderResult:
         panels = []
         for pairing_id, color in ((PAIRING_A, COLOR_A), (PAIRING_B, COLOR_B)):
             summary = summaries[pairing_id]
@@ -651,7 +665,7 @@ class JobManager:
                 job.job_id, {"type": "progress", "job_id": job.job_id, "progress": job.progress}
             )
 
-        render_comparison(
+        return render_comparison(
             paths.input_video(),
             paths.video,
             panels[0],

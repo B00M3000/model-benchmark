@@ -68,7 +68,9 @@ video:
   panel_width: 960
   fps: null          # null inherits the source frame rate
   mask_alpha: 0.45
-  codec: mp4v
+  # Only used if ffmpeg is missing. avc1 = H.264, the one codec browsers
+  # can play; mp4v writes MPEG-4 Part 2, which no browser will open.
+  codec: avc1
   draw_stats: true
 
 server:

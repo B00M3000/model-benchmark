@@ -255,8 +255,9 @@ that each repo's own runtime dependencies (`transformers`, `onnx`,
 `segment_anything`, `pycocotools`, `omegaconf`, `onnxsim`, `timm`, `triton`)
 are actually reachable — not just the repo itself, and not just the first of
 several missing ones — that torch2trt's `TRTModule` is new enough for the
-installed TensorRT, which weights and engines exist, and whether the clocks are pinned
-— each with the fix.
+installed TensorRT, which weights and engines exist, that an H.264 encoder is
+available so the comparison video is actually playable, and whether the clocks
+are pinned — each with the fix.
 
 Build the TensorRT engines and fetch weights (once, on the Orin — engines are
 tied to the exact TensorRT version and GPU that built them and cannot be copied
@@ -654,6 +655,44 @@ scripts, the fix is the same either way — actually install the package:
 ```bash
 .venv/bin/pip install -e nanosam --no-deps
 ```
+
+### The comparison video downloads but will not open (blank player, or QuickTime refuses it)
+
+Nothing errored, `has_video` is true, the file has a sensible size — and the
+player in the results page stays blank. VLC plays it fine, which makes it look
+like a player problem rather than a file problem.
+
+It isn't. The file is a valid `.mp4` whose *video stream* is in a codec no
+browser can decode. OpenCV's `VideoWriter` defaults — and this project's
+original `codec: mp4v` — write **MPEG-4 Part 2**, a 1998-era codec that
+`ffprobe` and VLC read happily and that Chrome, Firefox, Safari and QuickTime
+all refuse. Browsers only decode H.264 (`avc1`), H.265, VP8/VP9 and AV1 in a
+`<video>` element. Since nothing in the chain treats "unplayable codec" as an
+error, the failure is completely silent.
+
+Check what a file actually contains:
+
+```bash
+ffprobe -v error -select_streams v:0 -show_entries stream=codec_name data/jobs/<id>/comparison.mp4
+# h264  -> fine.   mpeg4 -> this bug.
+```
+
+**Fix:** install ffmpeg and re-run the job. The renderer prefers ffmpeg
+(H.264, `yuv420p`, and `-movflags +faststart` so playback can start before
+the whole file downloads) and only falls back to OpenCV when it is missing:
+
+```bash
+sudo apt install ffmpeg      # or: python3 scripts/doctor.py --fix
+```
+
+`doctor.py` checks for an H.264 encoder under **Comparison video encoder** and
+reports this before you spend a benchmark run on it. If no encoder can be
+found at all, the render still succeeds and the UI now says the file needs
+VLC, rather than showing an empty player.
+
+Note that pip's `opencv-python` wheels ship **without** an H.264 encoder for
+licensing reasons, so `avc1` fails there even though most distro OpenCV builds
+support it. That is why ffmpeg is the primary path rather than a fallback.
 
 ### "Numpy is not available" / "compiled using NumPy 1.x cannot be run in NumPy 2"
 

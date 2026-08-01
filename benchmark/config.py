@@ -94,7 +94,11 @@ class VideoConfig(BaseModel):
     panel_width: int = 960
     fps: float | None = None  # None = inherit the source frame rate
     mask_alpha: float = 0.45
-    codec: str = "mp4v"
+    #: Preferred OpenCV fourcc, used only when ffmpeg is unavailable.
+    #: "avc1" is H.264, the one codec every browser can play; the old
+    #: "mp4v" default wrote MPEG-4 Part 2, which produces a valid file
+    #: that no browser will open. See benchmark/video.py.
+    codec: str = "avc1"
     #: Burn per-frame latency and running FPS into each panel.
     draw_stats: bool = True
 

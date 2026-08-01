@@ -774,6 +774,12 @@ function renderVideoSlot(job) {
     slot.appendChild(el('div', { style: 'margin-top:12px' },
       el('a', { class: 'btn btn-ghost btn-sm', href: `/api/jobs/${job.job_id}/video`,
                 download: `comparison_${job.job_id}.mp4`, text: 'Download video' })));
+    // A codec the browser cannot decode renders as a silently blank player,
+    // so say so rather than letting it look like a broken render.
+    if (job.video_note) {
+      slot.appendChild(el('div', { class: 'note note-warn', style: 'margin-top:12px',
+                                   text: job.video_note }));
+    }
   } else if (job.state === 'rendering_video') {
     slot.dataset.job = '';
     slot.innerHTML = '';
