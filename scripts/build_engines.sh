@@ -265,36 +265,66 @@ EOF
 fi
 
 # ── EfficientViT-SAM ──────────────────────────────────────────────────────
-# The PyTorch path works out of the box with just the checkpoint; the
-# TensorRT engines are optional but markedly faster. config.yaml's
-# runtime: auto picks the engines when they exist.
-if [[ ! -f "$DATA_DIR/efficientvit_sam_l0.pt" ]]; then
-  log "Downloading EfficientViT-SAM-L0 checkpoint"
-  curl -fL --retry 4 --retry-delay 2 -o "$DATA_DIR/efficientvit_sam_l0.pt" \
-    "https://huggingface.co/mit-han-lab/efficientvit-sam/resolve/main/efficientvit_sam_l0.pt"
+# EfficientViT-SAM can run straight from the PyTorch checkpoint, but leaving
+# it there would quietly bias the whole study: pairing A (NanoSAM) is
+# TensorRT-only, so a PyTorch pairing B measures "EfficientViT-SAM without
+# TensorRT" and reports it as "EfficientViT-SAM". The engines are built here
+# so both pairings are compared on the same runtime; config.yaml's
+# runtime: auto then picks them up.
+#
+# Set EFFICIENTVIT_BUILD_ENGINES=0 to stay on the PyTorch path (faster setup,
+# but see the caveat above before comparing the numbers).
+EFFICIENTVIT_BUILD_ENGINES="${EFFICIENTVIT_BUILD_ENGINES:-1}"
+EVIT_MODEL="${EVIT_MODEL:-efficientvit-sam-l0}"
+EVIT_SLUG="${EVIT_MODEL//-/_}"
+
+if [[ ! -f "$DATA_DIR/$EVIT_SLUG.pt" ]]; then
+  log "Downloading ${EVIT_MODEL} checkpoint"
+  curl -fL --retry 4 --retry-delay 2 -o "$DATA_DIR/$EVIT_SLUG.pt" \
+    "https://huggingface.co/mit-han-lab/efficientvit-sam/resolve/main/$EVIT_SLUG.pt"
 else
   log "EfficientViT-SAM checkpoint already present, skipping"
 fi
 
-if [[ -f "$DATA_DIR/efficientvit_sam_l0_encoder.onnx" \
-   && ! -f "$DATA_DIR/efficientvit_sam_l0_encoder.engine" ]]; then
-  log "Building EfficientViT-SAM encoder engine"
-  trtexec \
-    --onnx="$DATA_DIR/efficientvit_sam_l0_encoder.onnx" \
-    --saveEngine="$DATA_DIR/efficientvit_sam_l0_encoder.engine" \
-    --fp16
-fi
+if [[ "$EFFICIENTVIT_BUILD_ENGINES" != "1" ]]; then
+  log "EFFICIENTVIT_BUILD_ENGINES=0 -- skipping engines, EfficientViT-SAM will run via PyTorch"
+elif [[ -f "$DATA_DIR/${EVIT_SLUG}_encoder.engine" \
+     && -f "$DATA_DIR/${EVIT_SLUG}_decoder.engine" ]]; then
+  log "EfficientViT-SAM engines already present, skipping"
+else
+  require_importable efficientvit \
+    "./scripts/setup_jetson.sh          # installs it along with the other model repos"
 
-if [[ -f "$DATA_DIR/efficientvit_sam_l0_decoder.onnx" \
-   && ! -f "$DATA_DIR/efficientvit_sam_l0_decoder.engine" ]]; then
-  log "Building EfficientViT-SAM decoder engine"
-  trtexec \
-    --onnx="$DATA_DIR/efficientvit_sam_l0_decoder.onnx" \
-    --saveEngine="$DATA_DIR/efficientvit_sam_l0_decoder.engine" \
-    --fp16 \
-    --minShapes=point_coords:1x1x2,point_labels:1x1 \
-    --optShapes=point_coords:1x4x2,point_labels:1x4 \
-    --maxShapes=point_coords:1x8x2,point_labels:1x8
+  # Exported by our own script rather than efficientvit's, because the
+  # upstream one declares a dynamic prompt batch -- which makes SAM's
+  # repeat_interleave lower to a OneHot feeding a shape tensor, the exact
+  # construct trtexec refuses (the NanoSAM failure, again). Both graphs come
+  # out fully static. See scripts/export_efficientvit_sam.py for the
+  # measurements behind that.
+  log "Exporting ${EVIT_MODEL} to ONNX"
+  "$PYTHON" scripts/export_efficientvit_sam.py \
+    --model "$EVIT_MODEL" \
+    --weights "$DATA_DIR/$EVIT_SLUG.pt" \
+    --encoder-output "$DATA_DIR/${EVIT_SLUG}_encoder.onnx" \
+    --decoder-output "$DATA_DIR/${EVIT_SLUG}_decoder.onnx"
+
+  # No --minShapes/--optShapes/--maxShapes on either build: both graphs are
+  # fully static, so there is no optimisation profile to specify.
+  if [[ ! -f "$DATA_DIR/${EVIT_SLUG}_encoder.engine" ]]; then
+    log "Building EfficientViT-SAM encoder engine (several minutes)"
+    trtexec \
+      --onnx="$DATA_DIR/${EVIT_SLUG}_encoder.onnx" \
+      --saveEngine="$DATA_DIR/${EVIT_SLUG}_encoder.engine" \
+      --fp16
+  fi
+
+  if [[ ! -f "$DATA_DIR/${EVIT_SLUG}_decoder.engine" ]]; then
+    log "Building EfficientViT-SAM mask decoder engine"
+    trtexec \
+      --onnx="$DATA_DIR/${EVIT_SLUG}_decoder.onnx" \
+      --saveEngine="$DATA_DIR/${EVIT_SLUG}_decoder.engine" \
+      --fp16
+  fi
 fi
 
 log "Done. Artefacts in $DATA_DIR:"

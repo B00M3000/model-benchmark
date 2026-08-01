@@ -266,6 +266,38 @@ between machines):
 ./scripts/build_engines.sh
 ```
 
+This builds four engines: NanoOWL's image encoder, NanoSAM's encoder and mask
+decoder, and — exported on the spot from efficientvit's own
+`applications/efficientvit_sam/deployment/onnx/` scripts — EfficientViT-SAM's
+encoder and mask decoder.
+
+**Why EfficientViT-SAM's engines are not optional.** EfficientViT-SAM runs
+happily from its PyTorch checkpoint alone, so it is tempting to skip them.
+Don't, if you intend to compare the two pairings: NanoSAM has no PyTorch path
+at all — `nanosam.utils.predictor.Predictor` only ever loads compiled engines —
+so a PyTorch pairing B measures *EfficientViT-SAM without TensorRT* and labels
+the result *EfficientViT-SAM*. Part of the gap you would read as "the
+segmentation backbone is slower" would just be "one side got TensorRT and the
+other didn't", which is precisely the confound this study exists to avoid.
+`doctor.py` reports missing EfficientViT-SAM engines as a problem for that
+reason, unless `efficientvit.runtime` is explicitly set to `torch`.
+
+`EFFICIENTVIT_BUILD_ENGINES=0 ./scripts/build_engines.sh` skips them anyway
+(faster setup, biased comparison); `EVIT_MODEL=efficientvit-sam-l1` builds a
+different variant.
+
+**Switching runtime changes the speed, not the masks.** EfficientViT-SAM's
+two runtimes are held to producing the same output: `benchmark/models/trt_sam.py`
+reuses upstream's own resize/pad/normalise transform, coordinate frame and
+mask postprocessing, and does the mask-token selection in Python so it
+matches `MaskDecoder.forward` rather than the different choice
+`--return-single-mask` bakes into the graph. Verified against
+`EfficientViTSamPredictor` on identical weights across landscape, portrait
+and square frames — bit-identical masks through the PyTorch modules, and
+identical to within one boundary pixel in ~9.5M when driven through the real
+exported ONNX. So a difference between pairing A and pairing B is a
+difference in the model, not an artefact of how it was run.
+
 ### "No module named 'torch2trt'"
 
 ```
@@ -420,6 +452,25 @@ NANOSAM_EXPORT_DECODER=1 ./scripts/build_engines.sh
 
 Expect this to reproduce the same TensorRT error on a modern torch, unless
 you also pin an older torch just for the export step.
+
+**EfficientViT-SAM's mask decoder hits the same wall, for a different
+reason** — and `scripts/export_efficientvit_sam.py` exists to avoid it. There
+the `OneHot` does not come from boolean-mask assignment at all: SAM's
+`MaskDecoder.predict_masks` runs
+`torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)`, and when
+the prompt batch is a dynamic axis that repeat count is symbolic, so torch
+lowers it to `OneHot` → `Tile` with the OneHot result feeding `Tile`'s
+*repeats* input — a shape tensor, which is exactly what TensorRT refuses.
+efficientvit's own `export_decoder.py` declares that dynamic batch axis, so
+using it directly reproduces the failure.
+
+Measured on the real graph, pinning the batch axis is *not* enough (the
+repeat count stays symbolic and both `OneHot` nodes survive); exporting fully
+static removes them, and folds the decoder from 1075 nodes to 436. Static
+shapes cost nothing here, since this app segments one box at a time and a box
+prompt is exactly one batch of two points. That is why the export is done by
+this project's script rather than upstream's, and why neither `trtexec`
+invocation for EfficientViT-SAM passes an optimisation profile.
 
 ### "No module named 'timm'"
 

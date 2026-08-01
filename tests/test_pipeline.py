@@ -306,3 +306,106 @@ def test_repo_paths_ignores_missing_directories(mock_config, monkeypatch):
     monkeypatch.setattr(sys, "path", list(sys.path))
     mock_config.repo_paths = ["/nonexistent/path/to/nowhere"]
     assert ensure_repo_paths(mock_config) == []
+
+
+def _trt_sam_predictor_with_stub_engines(frame_hw, embed=(64, 64), tokens=4):
+    """Build a TrtSamPredictor whose 'engines' are cheap stand-ins.
+
+    Exercises the geometry TrtSamPredictor owns -- resize/pad, the box ->
+    prompt-frame coordinate transform, mask-token slicing and the upscale/
+    crop/resize back to the source frame -- without loading TensorRT or the
+    real SAM weights.
+    """
+    import torch
+
+    import benchmark.models.trt_sam as trt_sam
+
+    seen = {}
+
+    def fake_encoder(tensor):
+        seen["encoder_input"] = tuple(tensor.shape)
+        return torch.zeros(1, 256, *embed)
+
+    def fake_decoder(features, coords, labels):
+        seen["coords"] = coords.clone()
+        seen["labels"] = labels.clone()
+        # Distinct per-token values so the slice below is observable.
+        masks = torch.arange(tokens, dtype=torch.float32).reshape(1, tokens, 1, 1)
+        masks = masks.expand(1, tokens, 256, 256).clone() - 1.5
+        iou = torch.arange(tokens, dtype=torch.float32).reshape(1, tokens)
+        return masks, iou
+
+    engines = {"enc": fake_encoder, "dec": fake_decoder}
+    original = trt_sam._load_engine
+    trt_sam._load_engine = lambda path, inputs, outputs: engines[path]
+    try:
+        predictor = trt_sam.TrtSamPredictor("enc", "dec", model="efficientvit-sam-l0", device="cpu")
+    finally:
+        trt_sam._load_engine = original
+    return predictor, seen
+
+
+def test_trt_sam_predictor_geometry():
+    """The TensorRT path must return masks in the source frame's resolution."""
+    pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    pytest.importorskip("efficientvit")
+
+    import numpy as np
+
+    height, width = 480, 640
+    predictor, seen = _trt_sam_predictor_with_stub_engines((height, width))
+
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    predictor.set_image(frame)
+
+    # The encoder always sees the padded square, whatever the frame's aspect.
+    assert seen["encoder_input"] == (1, 3, 512, 512)
+    # Prompts live in a 1024-long-side frame, not the encoder's 512 one.
+    assert predictor.input_size == (768, 1024)
+    assert predictor.original_size == (height, width)
+
+    box = (64.0, 48.0, 320.0, 240.0)
+    result = predictor.predict(box=np.array(box), multimask_output=False)
+    masks, iou, low_res = result
+
+    # Box corners are scaled into the prompt frame and labelled 2 / 3.
+    assert seen["coords"].shape == (1, 2, 2)
+    assert seen["labels"].tolist() == [[2.0, 3.0]]
+    np.testing.assert_allclose(
+        seen["coords"][0].numpy(),
+        [[box[0] * 1024 / width, box[1] * 768 / height],
+         [box[2] * 1024 / width, box[3] * 768 / height]],
+        rtol=1e-5,
+    )
+
+    # multimask_output=False takes mask token 0, matching MaskDecoder.forward.
+    assert masks.shape == (1, height, width)
+    assert low_res.shape == (1, 256, 256)
+    assert iou.tolist() == [0.0]
+    # Token 0's value is -1.5, i.e. below the 0.0 threshold -> all False.
+    assert masks.dtype == bool and not masks.any()
+
+
+def test_trt_sam_predictor_multimask_slices_tokens_one_onward():
+    pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    pytest.importorskip("efficientvit")
+
+    import numpy as np
+
+    predictor, _ = _trt_sam_predictor_with_stub_engines((480, 640))
+    predictor.set_image(np.zeros((480, 640, 3), dtype=np.uint8))
+    masks, iou, _ = predictor.predict(box=np.array([1.0, 2.0, 3.0, 4.0]), multimask_output=True)
+
+    assert masks.shape == (3, 480, 640)
+    assert iou.tolist() == [1.0, 2.0, 3.0]
+
+
+def test_trt_sam_predictor_rejects_unknown_model():
+    pytest.importorskip("torch")
+
+    import benchmark.models.trt_sam as trt_sam
+
+    with pytest.raises(ValueError, match="Unknown EfficientViT-SAM model"):
+        trt_sam.TrtSamPredictor("enc", "dec", model="efficientvit-sam-xxl")

@@ -71,11 +71,18 @@ class EfficientViTSamSegmenter(Segmenter):
     def _load_torch(self) -> None:
         try:
             from efficientvit.models.efficientvit.sam import EfficientViTSamPredictor
-            from efficientvit.sam_model_zoo import create_sam_model
+            from efficientvit.sam_model_zoo import create_efficientvit_sam_model
         except ImportError as exc:  # pragma: no cover - Jetson-only path
+            # Reporting exc matters: this catch fires both for "efficientvit
+            # isn't installed" and for "it is, but one of its own runtime
+            # dependencies is missing" (it pulls in segment_anything, timm,
+            # triton and more before the SAM predictor is usable). Without
+            # the cause, the two are indistinguishable and the message sends
+            # you off reinstalling something that was never the problem.
             raise BackendUnavailable(
-                "efficientvit is not importable on this host. Install "
-                "mit-han-lab/efficientvit on the Jetson, or run with backend=mock."
+                f"Cannot import efficientvit's SAM predictor: {exc}. "
+                "Run scripts/doctor.py -- it checks each of efficientvit's "
+                "runtime dependencies separately -- or use backend=mock."
             ) from exc
 
         if self.weights and not os.path.exists(self.weights):
@@ -84,7 +91,7 @@ class EfficientViTSamSegmenter(Segmenter):
                 "Download them with scripts/build_engines.sh."
             )
 
-        model = create_sam_model(self.model, True, self.weights)
+        model = create_efficientvit_sam_model(self.model, True, self.weights)
         self._model = model.to(self.device).eval()
         self._predictor = EfficientViTSamPredictor(self._model)
         self.variant = f"{self.model} (PyTorch)"
@@ -92,7 +99,12 @@ class EfficientViTSamSegmenter(Segmenter):
     def _load_tensorrt(self) -> None:  # pragma: no cover - Jetson-only path
         from .trt_sam import TrtSamPredictor
 
-        self._predictor = TrtSamPredictor(self.encoder_engine, self.decoder_engine)
+        self._predictor = TrtSamPredictor(
+            self.encoder_engine,
+            self.decoder_engine,
+            model=self.model,
+            device=self.device,
+        )
         self.variant = f"{self.model} (TensorRT)"
 
     def set_image(self, frame_rgb: np.ndarray, timer: StageTimer) -> None:

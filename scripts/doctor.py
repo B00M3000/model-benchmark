@@ -812,6 +812,22 @@ def check_efficientvit_runtime() -> None:
     else:
         ok("efficientvit.models.efficientvit.sam", "EfficientViTSamPredictor importable")
 
+    # Checked separately from the predictor because it fails separately:
+    # this is the model *factory*, and upstream has renamed it before. A
+    # rename raises ImportError from the same `except ImportError` that
+    # catches "efficientvit isn't installed", so without its own check the
+    # symptom is an install error for a package that is installed fine.
+    try:
+        from efficientvit.sam_model_zoo import create_efficientvit_sam_model  # noqa: F401
+    except Exception as exc:
+        bad(
+            "efficientvit.sam_model_zoo.create_efficientvit_sam_model missing",
+            f"{type(exc).__name__}: {str(exc).splitlines()[0]} -- the installed "
+            "efficientvit exposes a different model-factory name than this app calls",
+        )
+    else:
+        ok("efficientvit.sam_model_zoo", "create_efficientvit_sam_model importable")
+
 
 def install_onnx() -> bool:
     # No --no-deps: onnx doesn't declare torch, so there's nothing here for
@@ -921,13 +937,27 @@ def check_artifacts() -> None:
     from benchmark.config import load_config
 
     config = load_config()
+    # EfficientViT-SAM's engines are only genuinely optional when the config
+    # asks for the PyTorch runtime outright. On "auto" they are missing
+    # infrastructure, not a preference: the run still completes, but pairing
+    # A is TensorRT and pairing B silently is not, so the comparison stops
+    # measuring the segmentation head and starts measuring the runtime.
+    evit_engines_required = config.efficientvit.runtime != "torch"
     entries = [
         ("NanoOWL image encoder", config.nanoowl.image_encoder_engine, True),
         ("NanoSAM image encoder", config.nanosam.image_encoder_engine, True),
         ("NanoSAM mask decoder", config.nanosam.mask_decoder_engine, True),
         ("EfficientViT-SAM weights", config.efficientvit.weights, True),
-        ("EfficientViT-SAM encoder engine", config.efficientvit.encoder_engine, False),
-        ("EfficientViT-SAM decoder engine", config.efficientvit.decoder_engine, False),
+        (
+            "EfficientViT-SAM encoder engine",
+            config.efficientvit.encoder_engine,
+            evit_engines_required,
+        ),
+        (
+            "EfficientViT-SAM decoder engine",
+            config.efficientvit.decoder_engine,
+            evit_engines_required,
+        ),
     ]
     for label, raw, required in entries:
         path = config.resolve_path(raw)
@@ -942,7 +972,7 @@ def check_artifacts() -> None:
                 fix_action=build_artifacts,
             )
         else:
-            warn(label, "absent — EfficientViT-SAM will run via PyTorch instead")
+            warn(label, "absent — runtime: torch is set, so this is expected")
 
 
 def build_artifacts() -> bool:
