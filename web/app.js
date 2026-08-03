@@ -334,7 +334,7 @@ function renderProgress(p) {
     : (p.pairing_id === 'a' ? 'NanoOWL + NanoSAM' : 'NanoOWL + EfficientViT-SAM')
       + (p.warmup ? '  ·  warm-up (excluded from stats)' : '');
   $('live-counter').textContent = p.total ? `${p.processed} / ${p.total}` : `${p.processed}`;
-  $('live-bar').style.width = `${Math.min(100, p.pct || 0)}%`;
+  $('live-bar').style.transform = `scaleX(${Math.min(100, p.pct || 0) / 100})`;
 
   if (isVideo) {
     $('live-latency').textContent = '—';
@@ -804,17 +804,21 @@ async function loadHistory() {
   const list = $('history-list');
   list.innerHTML = '';
   if (!jobs.length) {
-    list.appendChild(el('p', { class: 'muted small', text: 'No runs yet.' }));
+    list.appendChild(el('p', { class: 'history-empty',
+      text: 'No runs yet. Upload a clip above and the run will appear here.' }));
     return;
   }
   jobs.forEach((job) => {
     const ok = job.state === 'complete' || job.state === 'complete_no_video';
     const bad = job.state === 'failed' || job.state === 'cancelled';
     list.appendChild(
-      el('div', { class: 'hitem', onclick: () => { attachToJob(job.job_id); renderJob(job); $('history-panel').classList.add('hidden'); $('progress').classList.remove('hidden'); } },
-        el('div', {},
-          el('div', { class: 'hitem-name', text: job.filename }),
-          el('div', { class: 'hitem-meta', text: new Date(job.created_at * 1000).toLocaleString() })),
+      // A real <button>, not a div with a click handler: these were
+      // unreachable by keyboard entirely.
+      el('button', { class: 'hitem', type: 'button',
+                     onclick: () => { attachToJob(job.job_id); renderJob(job); $('history-panel').classList.add('hidden'); $('progress').classList.remove('hidden'); } },
+        el('span', { class: 'hitem-left' },
+          el('span', { class: 'hitem-name', text: job.filename }),
+          el('span', { class: 'hitem-meta', text: new Date(job.created_at * 1000).toLocaleString() })),
         el('span', { class: `hstate ${ok ? 'hstate-ok' : bad ? 'hstate-bad' : 'hstate-run'}`, text: job.state })));
   });
 }
@@ -822,11 +826,29 @@ async function loadHistory() {
 /* ── boot ────────────────────────────────────────────────────────────── */
 async function init() {
   initUpload();
+  const historyPanel = $('history-panel');
+  const closeHistory = () => {
+    historyPanel.classList.add('hidden');
+    $('history-toggle').setAttribute('aria-expanded', 'false');
+  };
   $('history-toggle').addEventListener('click', () => {
-    $('history-panel').classList.toggle('hidden');
-    loadHistory();
+    const opening = historyPanel.classList.contains('hidden');
+    historyPanel.classList.toggle('hidden');
+    $('history-toggle').setAttribute('aria-expanded', String(opening));
+    if (opening) loadHistory();
   });
-  $('history-close').addEventListener('click', () => $('history-panel').classList.add('hidden'));
+  $('history-close').addEventListener('click', () => {
+    closeHistory();
+    $('history-toggle').focus();  // don't strand focus on a removed control
+  });
+  // A floating panel that only closes via its own button is a trap for
+  // anyone not using a mouse.
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !historyPanel.classList.contains('hidden')) {
+      closeHistory();
+      $('history-toggle').focus();
+    }
+  });
 
   try {
     const config = await (await fetch('/api/config')).json();
@@ -835,9 +857,13 @@ async function init() {
     if (config.is_mock) {
       const missing = config.missing_modules || [];
       badge.className = 'badge badge-mock';
+      // Naming every missing package here made the badge 444px wide and
+      // pushed the whole document sideways. The count carries the same
+      // signal; the full list is one hover away in the title, and the
+      // doctor prints it properly.
       badge.textContent = missing.length
-        ? `⚠ mock — missing ${missing.join(', ')}`
-        : '⚠ mock backend — synthetic numbers';
+        ? `mock — ${missing.length} module${missing.length > 1 ? 's' : ''} missing`
+        : 'mock backend — synthetic numbers';
       badge.title = (missing.length
         ? `Not importable on this host: ${missing.join(', ')}. Install them, or point `
           + `repo_paths in config.yaml at their git clones.\n\n`

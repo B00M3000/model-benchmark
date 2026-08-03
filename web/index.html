@@ -11,7 +11,15 @@
 
 <header class="topbar">
   <div class="brand">
-    <span class="logo" aria-hidden="true">◐</span>
+    <span class="logo" aria-hidden="true">
+      <!-- Split disc: one subject, two segmentation heads. Drawn rather than
+           borrowed from a Unicode glyph so it matches the icon stroke used
+           in the dropzone and the chip. -->
+      <svg viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7"/>
+        <path d="M12 3a9 9 0 0 0 0 18Z" fill="currentColor"/>
+      </svg>
+    </span>
     <div>
       <h1>Model Ablation Study</h1>
       <p>NanoOWL&nbsp;+&nbsp;NanoSAM &nbsp;vs&nbsp; NanoOWL&nbsp;+&nbsp;EfficientViT-SAM &nbsp;·&nbsp; Jetson Orin</p>
@@ -19,7 +27,8 @@
   </div>
   <div class="topbar-right">
     <div id="backend-badge" class="badge badge-muted">checking backend…</div>
-    <button id="history-toggle" class="btn btn-ghost" type="button">History</button>
+    <button id="history-toggle" class="btn btn-ghost" type="button"
+            aria-expanded="false" aria-controls="history-panel">History</button>
   </div>
 </header>
 
@@ -54,7 +63,12 @@
       <div id="file-chip" class="file-chip hidden">
         <span id="file-name"></span>
         <span id="file-size" class="muted"></span>
-        <button id="file-clear" class="chip-x" type="button" aria-label="Remove file">×</button>
+        <button id="file-clear" class="chip-x" type="button" aria-label="Remove file">
+          <svg viewBox="0 0 12 12" fill="none" aria-hidden="true">
+            <path d="M1.5 1.5l9 9m0-9l-9 9" stroke="currentColor" stroke-width="1.6"
+                  stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>
     </div>
 
