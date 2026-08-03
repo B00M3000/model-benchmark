@@ -656,6 +656,49 @@ scripts, the fix is the same either way — actually install the package:
 .venv/bin/pip install -e nanosam --no-deps
 ```
 
+### No boxes or masks in the comparison video, and the reported FPS looks too good
+
+Both symptoms, together, usually mean **the detector returned nothing**. The
+pipeline deliberately skips the segmenter when a frame has no detections (a
+real deployment would not encode an image it has nothing to segment), so zero
+detections removes `seg_encode` and `seg_decode` from every frame at once —
+which inflates FPS dramatically *and* leaves the render with nothing to draw.
+It looks like a rendering bug and is actually a detection bug.
+
+Check the per-frame data rather than the video:
+
+```bash
+curl -s localhost:8000/api/jobs/<id>/frames?pairing=a | head -c 600
+```
+
+If `num_detections` is `0` everywhere, the detector is the problem. If it is
+non-zero but the boxes are small decimals (`[0.31, 0.44, 0.52, 0.68]`) rather
+than pixel coordinates, boxes are being left in OWL-ViT's normalised 0..1
+space — they collapse to a dot at the origin when drawn with `int()`, and give
+both segmenters a sub-pixel prompt.
+
+That was a real bug in this adapter, fixed by routing detection through
+nanoowl's `encode_rois` instead of `encode_image`. `encode_image` looks like
+the natural split point for timing the encoder separately from the head, but
+it is the *middle* of the encode step: `preprocess_pil_image` does not resize,
+so the resize to the model's 768×768 input happens inside `encode_rois` (via
+`roi_align`), and so does the mapping of boxes from normalised coordinates
+back into frame pixels. Skipping it hands a full-resolution frame to an engine
+whose spatial dimensions are fixed at 768×768 (`--shapes=image:1x3x768x768`;
+only the batch axis is dynamic) and then interprets the result in the wrong
+coordinate space. Nothing raises — the detections just come back empty or
+sub-pixel.
+
+Two things worth knowing once detections are working:
+
+- **NanoOWL does not apply NMS.** `decode()` returns every patch above the
+  threshold, so one object can yield several overlapping boxes. Since the
+  pipeline segments *per detection*, `num_detections` drives `seg_decode` cost
+  directly — this is a real workload, but read the per-stage numbers alongside
+  `num_detections` rather than on their own.
+- **The default threshold is 0.1**, which is permissive. Raise it in the run
+  config if you are getting a wall of low-confidence boxes.
+
 ### The comparison video downloads but will not open (blank player, or QuickTime refuses it)
 
 Nothing errored, `has_video` is true, the file has a sensible size — and the

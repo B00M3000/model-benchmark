@@ -17,6 +17,13 @@ import numpy as np
 from ..timing import STAGE_DETECT, STAGE_DETECT_DECODE, STAGE_DETECT_ENCODE, StageTimer
 from .base import BackendUnavailable, Detection, Detector
 
+#: Pad the frame to a square before encoding, rather than stretching it.
+#: OWL-ViT is trained on square inputs, and squashing 16:9 into 768x768
+#: distorts every aspect ratio the model has learned. This is nanoowl's own
+#: default in OwlPredictor.predict; both detect paths here use it so the
+#: split and fallback paths cannot disagree about what was measured.
+PAD_SQUARE = True
+
 
 class NanoOwlDetector(Detector):
     name = "nanoowl"
@@ -59,7 +66,9 @@ class NanoOwlDetector(Detector):
         if self.image_encoder_engine:
             kwargs["image_encoder_engine"] = self.image_encoder_engine
         self._predictor = OwlPredictor(**kwargs)
-        self._can_split = hasattr(self._predictor, "encode_image") and hasattr(
+        # encode_rois, not encode_image: see _detect_split. encode_image alone
+        # is not a usable split point.
+        self._can_split = hasattr(self._predictor, "encode_rois") and hasattr(
             self._predictor, "decode"
         )
         self.variant = f"{self.model_name}" + (
@@ -85,17 +94,51 @@ class NanoOwlDetector(Detector):
         return self._detect_whole(image, timer)
 
     def _detect_split(self, image: Any, timer: StageTimer) -> list[Detection]:
-        """Preferred path: separate encoder cost from detection-head cost."""
+        """Preferred path: separate encoder cost from detection-head cost.
+
+        Goes through ``encode_rois`` rather than ``encode_image``, which is
+        what ``OwlPredictor.predict`` itself does, because encode_image is
+        not a usable split point on its own -- it is the middle of the
+        encode step, not the whole of it. Two things live in encode_rois
+        that nothing else does:
+
+        * **Resizing.** ``preprocess_pil_image`` only converts and
+          normalises; it does not resize. The resize to the model's
+          768x768 input happens inside ``encode_rois``, via
+          ``roi_align(..., output_size=get_image_size())``. Calling
+          encode_image directly hands the encoder a full-resolution frame,
+          and the TensorRT engine is built with the spatial dims fixed
+          (``--shapes=image:1x3x768x768``; only the batch axis is dynamic),
+          so it cannot answer meaningfully.
+        * **Box coordinates.** ``encode_image`` returns pred_boxes straight
+          out of a sigmoid -- normalised to 0..1. ``encode_rois`` applies
+          ``boxes * [w, h, w, h] + [x0, y0, x0, y0]`` to put them back in
+          the frame's pixel space, which is what Detection documents and
+          what both segmenters and the renderer expect.
+
+        Skipping it produced detections that were simultaneously garbage
+        (wrong encoder input) and sub-pixel (normalised boxes drawn with
+        int(), collapsing to a dot at the origin).
+        """
+        import torch
+
         predictor = self._predictor
         with timer.stage(STAGE_DETECT):
             with timer.stage(STAGE_DETECT_ENCODE):
                 image_tensor = predictor.image_preprocessor.preprocess_pil_image(image)
-                image_output = predictor.encode_image(image_tensor)
+                rois = torch.tensor(
+                    [[0, 0, image.width, image.height]],
+                    dtype=image_tensor.dtype,
+                    device=image_tensor.device,
+                )
+                image_output = predictor.encode_rois(
+                    image_tensor, rois, pad_square=PAD_SQUARE
+                )
             with timer.stage(STAGE_DETECT_DECODE):
                 output = predictor.decode(
                     image_output, self._text_encodings, threshold=self._threshold
                 )
-        return self._to_detections(output)
+        return self._to_detections(output, image.width, image.height)
 
     def _detect_whole(self, image: Any, timer: StageTimer) -> list[Detection]:
         """Fallback for nanoowl builds without the split API."""
@@ -105,11 +148,11 @@ class NanoOwlDetector(Detector):
                 text=self._prompts,
                 text_encodings=self._text_encodings,
                 threshold=self._threshold,
-                pad_square=False,
+                pad_square=PAD_SQUARE,
             )
-        return self._to_detections(output)
+        return self._to_detections(output, image.width, image.height)
 
-    def _to_detections(self, output: Any) -> list[Detection]:
+    def _to_detections(self, output: Any, width: int, height: int) -> list[Detection]:
         boxes = _to_numpy(getattr(output, "boxes", []))
         scores = _to_numpy(getattr(output, "scores", []))
         labels = _to_numpy(getattr(output, "labels", []))
@@ -119,6 +162,16 @@ class NanoOwlDetector(Detector):
             score = float(scores[i]) if i < len(scores) else 0.0
             name = self._prompts[idx] if 0 <= idx < len(self._prompts) else str(idx)
             x0, y0, x1, y1 = (float(v) for v in boxes[i][:4])
+            # Square padding makes the ROI extend past a non-square frame, so
+            # a box can legitimately come back partly outside it. Clamp here
+            # rather than leaving each segmenter to cope with prompts that
+            # point off-image.
+            x0 = min(max(x0, 0.0), float(width))
+            y0 = min(max(y0, 0.0), float(height))
+            x1 = min(max(x1, 0.0), float(width))
+            y1 = min(max(y1, 0.0), float(height))
+            if x1 <= x0 or y1 <= y0:
+                continue
             detections.append(
                 Detection(box=(x0, y0, x1, y1), score=score, label=name, label_index=idx)
             )
