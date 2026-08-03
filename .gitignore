@@ -18,3 +18,9 @@ htmlcov/
 *.swp
 .idea/
 .vscode/
+
+# Third-party agent skill, installed locally to run the UI polish pass.
+# Deliberately not vendored: `/plugin marketplace add pbakaus/impeccable`
+# installs it into your Claude config, not into this repo, and it is ~3.4 MB
+# of Apache-2.0 code that has nothing to do with the benchmark itself.
+.claude/skills/impeccable/
