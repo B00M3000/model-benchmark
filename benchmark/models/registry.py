@@ -27,28 +27,114 @@ PAIRING_B = "b"
 
 @dataclass(frozen=True)
 class Pairing:
+    """One detect-then-segment pipeline, bound to a comparison slot.
+
+    ``pairing_id`` is the *slot* (a or b), not the model identity -- results,
+    charts and the two video panels are all keyed by it. Which combination
+    occupies each slot comes from PAIRING_CATALOGUE and is chosen per run.
+    """
+
     pairing_id: str
+    label: str
+    detector: str
+    segmenter: str
+    description: str
+    spec_id: str = ""
+
+
+@dataclass(frozen=True)
+class PairingSpec:
+    """A selectable combination. Two of these are compared per job."""
+
+    spec_id: str
     label: str
     detector: str
     segmenter: str
     description: str
 
 
-PAIRINGS: tuple[Pairing, ...] = (
-    Pairing(
-        pairing_id=PAIRING_A,
+#: Everything that can be put in a slot. The detector/segmenter grid here
+#: covers Park, Kim & Ko (Front. Robot. AI 12, 2025), which benchmarks
+#: {NanoOWL, YOLO-World} x {NanoSAM, EfficientViT-SAM} on Jetson, so their
+#: table can be reproduced pair by pair.
+PAIRING_CATALOGUE: tuple[PairingSpec, ...] = (
+    PairingSpec(
+        spec_id="nanoowl+nanosam",
         label="NanoOWL + NanoSAM",
         detector="nanoowl",
         segmenter="nanosam",
         description="Open-vocab detection with a distilled ResNet18-encoder SAM head.",
     ),
-    Pairing(
-        pairing_id=PAIRING_B,
-        label="NanoOWL + EfficientViT-SAM",
+    PairingSpec(
+        spec_id="nanoowl+efficientvit_l0",
+        label="NanoOWL + EfficientViT-SAM-L0",
         detector="nanoowl",
-        segmenter="efficientvit_sam",
-        description="Same detector, EfficientViT-SAM segmentation head.",
+        segmenter="efficientvit_sam_l0",
+        description="Same detector, EfficientViT-SAM's smallest segmentation head.",
     ),
+    PairingSpec(
+        spec_id="nanoowl+efficientvit_l2",
+        label="NanoOWL + EfficientViT-SAM-L2",
+        detector="nanoowl",
+        segmenter="efficientvit_sam_l2",
+        description="Same detector, the larger L2 head -- accuracy against latency.",
+    ),
+    PairingSpec(
+        spec_id="yoloworld+nanosam",
+        label="YOLO-World-S + NanoSAM",
+        detector="yoloworld",
+        segmenter="nanosam",
+        description="Sentence-capable detector, PyTorch rather than TensorRT.",
+    ),
+    PairingSpec(
+        spec_id="yoloworld+efficientvit_l0",
+        label="YOLO-World-S + EfficientViT-SAM-L0",
+        detector="yoloworld",
+        segmenter="efficientvit_sam_l0",
+        description="YOLO-World's language range with the fastest SAM head.",
+    ),
+    PairingSpec(
+        spec_id="yoloworld+efficientvit_l2",
+        label="YOLO-World-S + EfficientViT-SAM-L2",
+        detector="yoloworld",
+        segmenter="efficientvit_sam_l2",
+        description="YOLO-World with the larger L2 head.",
+    ),
+)
+
+SPEC_BY_ID = {s.spec_id: s for s in PAIRING_CATALOGUE}
+
+#: The study this tool was built for: detector held constant, segmenter
+#: varied. Changing these changes what a default run measures, so they stay
+#: put unless a run asks for something else.
+DEFAULT_SPEC_A = "nanoowl+nanosam"
+DEFAULT_SPEC_B = "nanoowl+efficientvit_l0"
+
+
+def resolve_pairing(slot: str, spec_id: str) -> Pairing:
+    """Bind a catalogue entry to a comparison slot."""
+    try:
+        spec = SPEC_BY_ID[spec_id]
+    except KeyError:
+        raise ValueError(
+            f"Unknown pairing {spec_id!r}. Known: {', '.join(sorted(SPEC_BY_ID))}"
+        ) from None
+    return Pairing(
+        pairing_id=slot,
+        label=spec.label,
+        detector=spec.detector,
+        segmenter=spec.segmenter,
+        description=spec.description,
+        spec_id=spec.spec_id,
+    )
+
+
+#: What a run compares when nothing overrides it. Kept as a module-level
+#: name because the server, the mock backends and the tests all want the
+#: default shape without constructing a run first.
+PAIRINGS: tuple[Pairing, ...] = (
+    resolve_pairing(PAIRING_A, DEFAULT_SPEC_A),
+    resolve_pairing(PAIRING_B, DEFAULT_SPEC_B),
 )
 
 PAIRING_BY_ID = {p.pairing_id: p for p in PAIRINGS}
@@ -270,14 +356,34 @@ def resolve_backend(config: AppConfig) -> str:
     return "jetson" if jetson_backends_available(config) else "mock"
 
 
-def build_detector(config: AppConfig, backend: str) -> Detector:
+def build_detector(config: AppConfig, backend: str, detector: str = "nanoowl") -> Detector:
     if backend == "mock":
         from .mock import MockDetector
 
+        if detector == "yoloworld":
+            return MockDetector(
+                label="mock YOLO-World-S",
+                encode_ms=config.mock.yoloworld_detect_ms,
+                decode_ms=0.0,
+                jitter_ms=config.mock.jitter_ms,
+                split_stages=False,
+            )
         return MockDetector(
             encode_ms=config.mock.detector_encode_ms,
             decode_ms=config.mock.detector_decode_ms,
             jitter_ms=config.mock.jitter_ms,
+        )
+
+    if detector == "yoloworld":
+        from .yoloworld_detector import YoloWorldDetector
+
+        return YoloWorldDetector(
+            model=config.yoloworld.model,
+            weights=config.resolve_path(config.yoloworld.weights),
+            imgsz=config.yoloworld.imgsz,
+            device=config.yoloworld.device,
+            precision=config.yoloworld.precision,
+            max_det=config.yoloworld.max_det,
         )
 
     from .nanoowl_detector import NanoOwlDetector
@@ -287,6 +393,15 @@ def build_detector(config: AppConfig, backend: str) -> Detector:
         image_encoder_engine=config.resolve_path(config.nanoowl.image_encoder_engine),
         device=config.nanoowl.device,
     )
+
+
+#: EfficientViT-SAM variants -> the AppConfig attribute holding their paths.
+EFFICIENTVIT_VARIANTS = {
+    "efficientvit_sam_l0": "efficientvit",
+    "efficientvit_sam_l2": "efficientvit_l2",
+    # Pre-split name, so an older config or saved job still resolves.
+    "efficientvit_sam": "efficientvit",
+}
 
 
 def build_segmenter(config: AppConfig, backend: str, segmenter: str) -> Segmenter:
@@ -301,8 +416,16 @@ def build_segmenter(config: AppConfig, backend: str, segmenter: str) -> Segmente
                 jitter_ms=config.mock.jitter_ms,
                 seed=1,
             )
+        if segmenter == "efficientvit_sam_l2":
+            return MockSegmenter(
+                label="mock EfficientViT-SAM-L2",
+                encode_ms=config.mock.efficientvit_l2_encode_ms,
+                decode_ms=config.mock.efficientvit_l2_decode_ms,
+                jitter_ms=config.mock.jitter_ms,
+                seed=3,
+            )
         return MockSegmenter(
-            label="mock EfficientViT-SAM",
+            label="mock EfficientViT-SAM-L0",
             encode_ms=config.mock.efficientvit_encode_ms,
             decode_ms=config.mock.efficientvit_decode_ms,
             jitter_ms=config.mock.jitter_ms,
@@ -319,13 +442,20 @@ def build_segmenter(config: AppConfig, backend: str, segmenter: str) -> Segmente
 
     from .efficientvit_segmenter import EfficientViTSamSegmenter
 
+    attr = EFFICIENTVIT_VARIANTS.get(segmenter)
+    if attr is None:
+        raise ValueError(
+            f"Unknown segmenter {segmenter!r}. Known: nanosam, "
+            f"{', '.join(sorted(EFFICIENTVIT_VARIANTS))}"
+        )
+    settings = getattr(config, attr)
     return EfficientViTSamSegmenter(
-        model=config.efficientvit.model,
-        weights=config.resolve_path(config.efficientvit.weights),
-        runtime=config.efficientvit.runtime,
-        encoder_engine=config.resolve_path(config.efficientvit.encoder_engine),
-        decoder_engine=config.resolve_path(config.efficientvit.decoder_engine),
-        device=config.efficientvit.device,
+        model=settings.model,
+        weights=config.resolve_path(settings.weights),
+        runtime=settings.runtime,
+        encoder_engine=config.resolve_path(settings.encoder_engine),
+        decoder_engine=config.resolve_path(settings.decoder_engine),
+        device=settings.device,
     )
 
 

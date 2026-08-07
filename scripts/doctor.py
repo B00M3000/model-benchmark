@@ -829,6 +829,79 @@ def check_efficientvit_runtime() -> None:
         ok("efficientvit.sam_model_zoo", "create_efficientvit_sam_model importable")
 
 
+def install_yoloworld() -> bool:
+    # --no-deps is mandatory: ultralytics declares torch, torchvision AND
+    # opencv-python. The first two would replace JetPack's builds; the third
+    # would shadow JetPack's cv2, which is the one built with CUDA and
+    # GStreamer. Its remaining dependencies are safe and installed by name.
+    ok_pkg = run_fix(
+        "install ultralytics (YOLO-World-S detector)",
+        [sys.executable, "-m", "pip", "install", "ultralytics", "--no-deps"],
+    )
+    ok_deps = run_fix(
+        "install ultralytics' safe dependencies (no torch, no opencv-python)",
+        [sys.executable, "-m", "pip", "install", "filelock", "matplotlib", "pillow",
+         "pyyaml", "requests", "psutil", "polars", "nvidia-ml-py", "ultralytics-thop"],
+    )
+    return ok_pkg and ok_deps
+
+
+def install_clip() -> bool:
+    ok_pkg = run_fix(
+        "install CLIP (encodes YOLO-World's prompts)",
+        [sys.executable, "-m", "pip", "install",
+         "git+https://github.com/ultralytics/CLIP.git", "--no-deps"],
+    )
+    ok_deps = run_fix(
+        "install CLIP's own dependencies",
+        [sys.executable, "-m", "pip", "install", "ftfy", "regex", "tqdm"],
+    )
+    return ok_pkg and ok_deps
+
+
+def check_yoloworld_runtime() -> None:
+    """YOLO-World-S, the optional second detector.
+
+    Warnings rather than problems: nothing in the default NanoOWL pairings
+    touches any of this, so a host that never selects a YOLO-World pairing
+    is completely fine without it.
+    """
+    section("YOLO-World-S runtime (optional second detector)")
+    try:
+        from ultralytics import YOLOWorld  # noqa: F401
+    except ImportError as exc:
+        warn(
+            "ultralytics not importable",
+            f"{type(exc).__name__}: {str(exc).splitlines()[0]} -- only needed for "
+            "the YOLO-World pairings",
+            "pip install ultralytics --no-deps   # --no-deps: it declares torch, "
+            "torchvision and opencv-python",
+            fix_action=install_yoloworld,
+        )
+        return
+    ok("ultralytics", "YOLOWorld importable")
+
+    # The important one. Without clip, ultralytics runs `pip install
+    # git+.../CLIP.git` itself the first time set_classes() is called --
+    # no --no-deps, and CLIP declares torch and torchvision. That is PyPI
+    # torch landing on JetPack's build in the middle of a benchmark.
+    try:
+        import clip  # noqa: F401
+    except ImportError:
+        warn(
+            "clip not importable",
+            "YOLO-World encodes its prompts with CLIP. Left missing, ultralytics "
+            "pip-installs it MID-RUN without --no-deps, and CLIP declares torch "
+            "and torchvision -- so the first YOLO-World run would replace "
+            "JetPack's torch with a PyPI wheel",
+            "pip install git+https://github.com/ultralytics/CLIP.git --no-deps"
+            " && pip install ftfy regex tqdm",
+            fix_action=install_clip,
+        )
+    else:
+        ok("clip", "prompt encoder present, so ultralytics will not self-install it")
+
+
 def install_onnx() -> bool:
     # No --no-deps: onnx doesn't declare torch, so there's nothing here for
     # --no-deps to protect against. Its numpy>=1.23.2 is already satisfied
@@ -1122,6 +1195,7 @@ CHECKS = (
     check_nanoowl_runtime,
     check_nanosam_runtime,
     check_efficientvit_runtime,
+    check_yoloworld_runtime,
     check_torch2trt,
     check_onnx_export,
     check_artifacts,

@@ -13,6 +13,34 @@ comparison video is rendered afterwards so mask quality can be judged by eye.
 The detector is identical in both, so the study isolates the cost of the
 segmentation head.
 
+### Choosing what to compare
+
+Those two are the default, not the limit. Each run picks two entries from a
+catalogue covering both detectors against all three segmentation heads:
+
+| | NanoSAM | EfficientViT-SAM-L0 | EfficientViT-SAM-L2 |
+|---|---|---|---|
+| **NanoOWL** (TensorRT) | ✓ default A | ✓ default B | ✓ |
+| **YOLO-World-S** (PyTorch) | ✓ | ✓ | ✓ |
+
+That grid is the one in Park, Kim & Ko,
+[*Real-time open-vocabulary perception for mobile robots on edge devices*](https://pmc.ncbi.nlm.nih.gov/articles/PMC12583037/)
+(Front. Robot. AI 12, 2025), so their table can be reproduced pair by pair on
+your own hardware and footage.
+
+**Read the delta according to what you varied.** Hold the detector constant
+and the gap is attributable to the segmentation head — that is the clean
+ablation. Hold the segmenter constant and it is the detector. Change both
+(NanoOWL + NanoSAM against YOLO-World-S + L2) and the difference cannot be
+attributed to either alone; the UI says so under the selector rather than
+letting the number stand unqualified.
+
+**YOLO-World is the slower one by construction.** Ultralytics has no TensorRT
+export that keeps the open-vocabulary text head, so it runs in PyTorch while
+NanoOWL's image encoder runs through TensorRT. It buys understanding of
+longer phrases than NanoOWL's noun-phrase encoder handles — the trade the
+paper measures, and the reason both are here.
+
 <br>
 
 ## What it measures
@@ -698,6 +726,40 @@ Two things worth knowing once detections are working:
   `num_detections` rather than on their own.
 - **The default threshold is 0.1**, which is permissive. Raise it in the run
   config if you are getting a wall of low-confidence boxes.
+
+### "No module named 'ultralytics'" / "No module named 'clip'"
+
+Only the YOLO-World pairings need these; every NanoOWL pairing runs without
+them, and `doctor.py` reports them as warnings rather than problems for that
+reason.
+
+```bash
+pip install ultralytics --no-deps
+pip install filelock matplotlib pillow pyyaml requests psutil polars \
+            nvidia-ml-py ultralytics-thop
+pip install git+https://github.com/ultralytics/CLIP.git --no-deps
+pip install ftfy regex tqdm
+```
+
+**`--no-deps` is not optional here, and CLIP is not optional either.**
+ultralytics declares `torch`, `torchvision` **and** `opencv-python` as hard
+dependencies: the first two would replace JetPack's builds — the failure the
+rest of this document is about — and the third would shadow JetPack's `cv2`,
+which is the one compiled with CUDA and GStreamer. Its remaining
+dependencies are safe, which is why they are installed by name above.
+
+CLIP matters for a subtler reason. YOLO-World encodes its prompts through
+CLIP inside `set_classes()`, and if the import fails **ultralytics shells out
+to pip itself** to install it — no `--no-deps` — the first time a prompt is
+set. CLIP declares torch and torchvision too. So a missing CLIP does not
+produce a clean error: it produces PyPI torch landing on top of JetPack's
+build in the middle of a benchmark run. `scripts/setup_jetson.sh` installs it
+ahead of time precisely so that path is never taken, and the backend refuses
+to load rather than letting ultralytics reach for pip.
+
+`build_engines.sh` also pre-fetches CLIP's ViT-B/32 weights, which are
+otherwise downloaded on first use — worth having on a bench with no route
+out. `SKIP_YOLOWORLD=1` skips all of it in both scripts.
 
 ### The comparison video downloads but will not open (blank player, or QuickTime refuses it)
 

@@ -409,3 +409,93 @@ def test_trt_sam_predictor_rejects_unknown_model():
 
     with pytest.raises(ValueError, match="Unknown EfficientViT-SAM model"):
         trt_sam.TrtSamPredictor("enc", "dec", model="efficientvit-sam-xxl")
+
+
+def test_every_catalogue_pairing_builds_a_mock_backend(mock_config):
+    """Every selectable pairing must resolve to a backend, not just the two
+    the default study compares."""
+    from benchmark.models.registry import (
+        PAIRING_CATALOGUE,
+        build_detector,
+        build_segmenter,
+    )
+
+    assert len(PAIRING_CATALOGUE) >= 6
+    labels = set()
+    for spec in PAIRING_CATALOGUE:
+        detector = build_detector(mock_config, "mock", spec.detector)
+        segmenter = build_segmenter(mock_config, "mock", spec.segmenter)
+        assert detector is not None and segmenter is not None
+        labels.add((detector.variant, segmenter.variant))
+    # Each distinct combination must produce a distinct pair of backends --
+    # if L0 and L2 collapsed onto one mock, a run would compare a model
+    # against itself and report the difference as noise.
+    assert len(labels) == len(PAIRING_CATALOGUE)
+
+
+def test_efficientvit_variants_resolve_to_different_weights(mock_config):
+    """L0 and L2 are separate checkpoints and separate engines."""
+    from benchmark.models.registry import build_segmenter
+
+    l0 = build_segmenter(mock_config, "jetson", "efficientvit_sam_l0")
+    l2 = build_segmenter(mock_config, "jetson", "efficientvit_sam_l2")
+    assert l0.model == "efficientvit-sam-l0"
+    assert l2.model == "efficientvit-sam-l2"
+    assert l0.weights != l2.weights
+    assert l0.encoder_engine != l2.encoder_engine
+    assert l0.decoder_engine != l2.decoder_engine
+
+
+def test_legacy_segmenter_name_still_resolves(mock_config):
+    """Jobs saved before the L0/L2 split recorded the old name."""
+    from benchmark.models.registry import build_segmenter
+
+    assert build_segmenter(mock_config, "jetson", "efficientvit_sam").model == (
+        "efficientvit-sam-l0"
+    )
+
+
+def test_unknown_segmenter_is_rejected(mock_config):
+    from benchmark.models.registry import build_segmenter
+
+    with pytest.raises(ValueError, match="Unknown segmenter"):
+        build_segmenter(mock_config, "jetson", "efficientvit_sam_l9")
+
+
+def test_resolve_pairing_binds_a_spec_to_a_slot():
+    from benchmark.models.registry import resolve_pairing
+
+    pairing = resolve_pairing("b", "yoloworld+efficientvit_l2")
+    assert pairing.pairing_id == "b"          # the slot
+    assert pairing.spec_id == "yoloworld+efficientvit_l2"
+    assert pairing.detector == "yoloworld"
+    assert pairing.segmenter == "efficientvit_sam_l2"
+
+    with pytest.raises(ValueError, match="Unknown pairing"):
+        resolve_pairing("a", "nope")
+
+
+def test_detector_is_only_shared_when_both_slots_use_the_same_one():
+    """Sharing one loaded detector across slots is only valid when both
+    slots actually use it -- otherwise pairing B runs pairing A's detector."""
+    from benchmark.jobs import resolve_run_pairings
+    from benchmark.pipeline import RunConfig
+
+    same = resolve_run_pairings(
+        RunConfig(pairing_a="nanoowl+nanosam", pairing_b="nanoowl+efficientvit_l2")
+    )
+    assert len({p.detector for p in same}) == 1
+
+    mixed = resolve_run_pairings(
+        RunConfig(pairing_a="nanoowl+nanosam", pairing_b="yoloworld+efficientvit_l0")
+    )
+    assert len({p.detector for p in mixed}) == 2
+
+
+def test_run_config_defaults_to_the_study_pairings():
+    from benchmark.jobs import resolve_run_pairings
+    from benchmark.models.registry import DEFAULT_SPEC_A, DEFAULT_SPEC_B
+    from benchmark.pipeline import RunConfig
+
+    a, b = resolve_run_pairings(RunConfig())
+    assert (a.spec_id, b.spec_id) == (DEFAULT_SPEC_A, DEFAULT_SPEC_B)

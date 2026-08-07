@@ -275,7 +275,12 @@ fi
 # Set EFFICIENTVIT_BUILD_ENGINES=0 to stay on the PyTorch path (faster setup,
 # but see the caveat above before comparing the numbers).
 EFFICIENTVIT_BUILD_ENGINES="${EFFICIENTVIT_BUILD_ENGINES:-1}"
-EVIT_MODEL="${EVIT_MODEL:-efficientvit-sam-l0}"
+# Which EfficientViT-SAM variants to prepare. Both L0 and L2 are selectable
+# pairings, so both are built by default; EVIT_MODELS=efficientvit-sam-l0
+# builds just the small one.
+EVIT_MODELS="${EVIT_MODELS:-efficientvit-sam-l0 efficientvit-sam-l2}"
+
+for EVIT_MODEL in $EVIT_MODELS; do
 EVIT_SLUG="${EVIT_MODEL//-/_}"
 
 if [[ ! -f "$DATA_DIR/$EVIT_SLUG.pt" ]]; then
@@ -324,6 +329,43 @@ else
       --onnx="$DATA_DIR/${EVIT_SLUG}_decoder.onnx" \
       --saveEngine="$DATA_DIR/${EVIT_SLUG}_decoder.engine" \
       --fp16
+  fi
+fi
+
+done
+
+# ── YOLO-World-S ──────────────────────────────────────────────────────────
+# No engine to build: ultralytics has no TensorRT export that keeps the
+# open-vocabulary text head, so this pairing runs in PyTorch by design and
+# only the checkpoint is needed. SKIP_YOLOWORLD=1 to leave it out.
+if [[ "${SKIP_YOLOWORLD:-0}" == "1" ]]; then
+  log "SKIP_YOLOWORLD=1 -- skipping the YOLO-World checkpoint"
+else
+  YOLOWORLD_WEIGHTS="${YOLOWORLD_WEIGHTS:-yolov8s-worldv2.pt}"
+  if [[ -f "$DATA_DIR/$YOLOWORLD_WEIGHTS" ]]; then
+    log "YOLO-World checkpoint already present, skipping"
+  else
+    log "Downloading $YOLOWORLD_WEIGHTS"
+    if ! curl -fL --retry 4 --retry-delay 2 -o "$DATA_DIR/$YOLOWORLD_WEIGHTS" \
+        "https://github.com/ultralytics/assets/releases/download/v8.3.0/$YOLOWORLD_WEIGHTS"; then
+      rm -f "$DATA_DIR/$YOLOWORLD_WEIGHTS"
+      echo "Fetch failed. Download $YOLOWORLD_WEIGHTS by hand from" >&2
+      echo "  https://github.com/ultralytics/assets/releases" >&2
+      echo "and save it to $DATA_DIR/$YOLOWORLD_WEIGHTS" >&2
+      exit 1
+    fi
+  fi
+
+  # CLIP's ViT-B/32 weights are fetched on first use, from inside
+  # set_classes(). Pull them now so the first benchmark run does not stall
+  # on a download -- or fail outright on a bench with no route out.
+  if "$PYTHON" -c 'import clip' >/dev/null 2>&1; then
+    log "Priming CLIP's ViT-B/32 weights (first set_classes() would otherwise download them)"
+    "$PYTHON" - <<'PYEOF' || echo "  ! could not pre-fetch CLIP weights; the first run will try again"
+import clip
+clip.load("ViT-B/32", device="cpu")
+print("  CLIP ViT-B/32 ready")
+PYEOF
   fi
 fi
 

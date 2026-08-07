@@ -193,3 +193,50 @@ def test_prompts_default_when_blank(client, synthetic_video):
     response = _submit(client, synthetic_video, prompts="   ")
     job = response.json()
     assert job["run_config"]["prompts"] == ["a person"]
+
+
+def test_pairings_are_selectable_per_run(client, synthetic_video):
+    """A run can compare any two catalogue entries, not just the defaults."""
+    response = _submit(
+        client, synthetic_video,
+        pairing_a="nanoowl+efficientvit_l0",
+        pairing_b="nanoowl+efficientvit_l2",
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    job = _wait_for_terminal(client, job_id)
+    assert job["state"] in {COMPLETE, COMPLETE_NO_VIDEO}
+    assert job["run_config"]["pairing_a"] == "nanoowl+efficientvit_l0"
+    assert job["run_config"]["pairing_b"] == "nanoowl+efficientvit_l2"
+    # And the results are labelled with what actually ran.
+    results = client.get(f"/api/jobs/{job_id}/results").json()
+    assert "L0" in results["pairings"]["a"]["label"]
+    assert "L2" in results["pairings"]["b"]["label"]
+
+
+def test_mixed_detector_run_completes(client, synthetic_video):
+    """NanoOWL against YOLO-World: the detector cannot be shared, so this
+    exercises the per-slot load path."""
+    job_id = _submit(
+        client, synthetic_video,
+        pairing_a="nanoowl+nanosam",
+        pairing_b="yoloworld+efficientvit_l0",
+    ).json()["job_id"]
+    job = _wait_for_terminal(client, job_id)
+    assert job["state"] in {COMPLETE, COMPLETE_NO_VIDEO}
+    assert job["lifecycle"]["share_detector"] is False
+
+
+def test_unknown_pairing_is_rejected(client, synthetic_video):
+    response = _submit(client, synthetic_video, pairing_a="nanoowl+telepathy")
+    assert response.status_code == 400
+    assert "telepathy" in response.json()["detail"]
+
+
+def test_config_exposes_the_pairing_catalogue(client):
+    config = client.get("/api/config").json()
+    ids = {p["id"] for p in config["pairing_catalogue"]}
+    assert {"nanoowl+nanosam", "nanoowl+efficientvit_l2",
+            "yoloworld+efficientvit_l0", "yoloworld+efficientvit_l2"} <= ids
+    assert config["default_pairing_a"] in ids
+    assert config["default_pairing_b"] in ids

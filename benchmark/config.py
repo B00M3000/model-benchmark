@@ -28,6 +28,28 @@ class NanoSamConfig(BaseModel):
     mask_decoder_engine: str = "data/mobile_sam_mask_decoder.engine"
 
 
+class YoloWorldConfig(BaseModel):
+    """YOLO-World-S, the second open-vocabulary detector.
+
+    PyTorch only: ultralytics has no TensorRT path that keeps the
+    open-vocabulary text head, so this is slower than NanoOWL by
+    construction. That is the point of having it -- it trades latency for
+    understanding phrases NanoOWL's noun-phrase encoder cannot.
+    """
+
+    model: str = "yolov8s-worldv2.pt"
+    weights: str | None = "data/yolov8s-worldv2.pt"
+    #: Square input the model runs at. Ultralytics' own default.
+    imgsz: int = 640
+    device: str = "cuda"
+    precision: Literal["fp16", "fp32"] = "fp16"
+    #: Ultralytics defaults this to 300. The pipeline decodes one mask per
+    #: detection, so 300 boxes on a frame means 300 mask decodes -- minutes
+    #: of segmentation for a frame nobody asked about. 100 is still far
+    #: above anything a real scene produces at a sane threshold.
+    max_det: int = 100
+
+
 class EfficientViTConfig(BaseModel):
     model: str = "efficientvit-sam-l0"
     weights: str | None = "data/efficientvit_sam_l0.pt"
@@ -42,10 +64,16 @@ class MockConfig(BaseModel):
 
     detector_encode_ms: float = 8.0
     detector_decode_ms: float = 2.0
+    #: One stage, not two: YOLO-World has no encode/decode seam to split.
+    #: Deliberately the slowest detector here, matching the published
+    #: ordering against a TensorRT NanoOWL.
+    yoloworld_detect_ms: float = 26.0
     nanosam_encode_ms: float = 10.0
     nanosam_decode_ms: float = 3.0
     efficientvit_encode_ms: float = 17.0
     efficientvit_decode_ms: float = 5.0
+    efficientvit_l2_encode_ms: float = 24.0
+    efficientvit_l2_decode_ms: float = 6.0
     jitter_ms: float = 1.5
 
 
@@ -124,8 +152,20 @@ class AppConfig(BaseModel):
     #: installs fail for reasons unrelated to the models themselves.
     repo_paths: list[str] = Field(default_factory=list)
     nanoowl: NanoOwlConfig = Field(default_factory=NanoOwlConfig)
+    yoloworld: YoloWorldConfig = Field(default_factory=YoloWorldConfig)
     nanosam: NanoSamConfig = Field(default_factory=NanoSamConfig)
+    #: EfficientViT-SAM-L0. Named `efficientvit` rather than
+    #: `efficientvit_l0` so existing config.yaml files keep working.
     efficientvit: EfficientViTConfig = Field(default_factory=EfficientViTConfig)
+    #: EfficientViT-SAM-L2: same architecture family, larger backbone.
+    efficientvit_l2: EfficientViTConfig = Field(
+        default_factory=lambda: EfficientViTConfig(
+            model="efficientvit-sam-l2",
+            weights="data/efficientvit_sam_l2.pt",
+            encoder_engine="data/efficientvit_sam_l2_encoder.engine",
+            decoder_engine="data/efficientvit_sam_l2_decoder.engine",
+        )
+    )
     mock: MockConfig = Field(default_factory=MockConfig)
     run: RunDefaults = Field(default_factory=RunDefaults)
     lifecycle: ModelLifecycle = Field(default_factory=ModelLifecycle)

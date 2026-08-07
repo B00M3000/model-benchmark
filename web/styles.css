@@ -227,6 +227,15 @@ main {
   transition: border-color .15s;
   min-width: 0; width: 100%;
 }
+.field-select {
+  background: var(--bg); border: 1px solid var(--line-control); color: var(--text);
+  border-radius: var(--radius-sm); padding: 9px 11px;
+  font-family: var(--sans); font-size: 13px;
+  min-width: 0; width: 100%; cursor: pointer;
+  transition: border-color .15s;
+}
+.field-select:hover { border-color: #6a7b91; }
+.field-select:focus { border-color: var(--accent); }
 .field input::placeholder { color: var(--text-faint); }
 .field input:hover { border-color: #6a7b91; }
 .field input:focus { border-color: var(--accent); }

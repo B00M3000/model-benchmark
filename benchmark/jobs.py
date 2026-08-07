@@ -6,8 +6,10 @@ every latency number this tool produces.
 
 Both pairings run inside this one process. The CUDA context, TensorRT
 runtime and PyTorch allocator initialise once per job rather than once per
-pairing, and NanoOWL (identical in both pairings) stays resident across the
-swap. Only the segmentation head is torn down and rebuilt between runs.
+pairing. When both slots use the same detector it is loaded once and stays
+resident across the swap, so only the segmentation head is rebuilt; when
+they use different detectors -- NanoOWL against YOLO-World -- each slot
+loads and releases its own.
 """
 
 from __future__ import annotations
@@ -28,12 +30,15 @@ from .config import AppConfig
 from .metrics import PairingSummary, compare, histogram
 from .models.base import BackendUnavailable, Detector, Segmenter
 from .models.registry import (
+    DEFAULT_SPEC_A,
+    DEFAULT_SPEC_B,
     PAIRING_A,
     PAIRING_B,
-    PAIRINGS,
+    Pairing,
     build_detector,
     build_segmenter,
     resolve_backend,
+    resolve_pairing,
 )
 from .pipeline import CancelledError, RunConfig, VideoInfo, probe_video, run_pairing
 from .storage import JobPaths, load_masks, read_json, read_jsonl, write_json
@@ -171,6 +176,14 @@ class EventHub:
             loop.call_soon_threadsafe(_deliver)
         except RuntimeError:
             pass
+
+
+def resolve_run_pairings(run: RunConfig) -> tuple[Pairing, ...]:
+    """Bind the run's chosen catalogue entries to slots A and B."""
+    return (
+        resolve_pairing(PAIRING_A, run.pairing_a or DEFAULT_SPEC_A),
+        resolve_pairing(PAIRING_B, run.pairing_b or DEFAULT_SPEC_B),
+    )
 
 
 def environment_snapshot(backend: str) -> dict[str, Any]:
@@ -433,36 +446,57 @@ class JobManager:
         all_frames: dict[str, list[dict[str, Any]]] = {}
         lifecycle = self.config.lifecycle
 
+        pairings = resolve_run_pairings(run)
+        job.lifecycle["pairings"] = {p.pairing_id: p.spec_id for p in pairings}
+        # Sharing one loaded detector across both slots is only valid when
+        # both slots actually use the same detector. Comparing NanoOWL
+        # against YOLO-World means each slot must load its own.
+        share_detector = (
+            lifecycle.share_detector
+            and not lifecycle.reload_between_runs
+            and len({p.detector for p in pairings}) == 1
+        )
+
         try:
-            # --- detector: loaded once, reused across both pairings --------
-            detector = build_detector(self.config, backend)
-            detector.load()
-            text_encode_ms = detector.set_prompts(run.prompts, run.threshold)
-            job.lifecycle["detector_load_ms"] = round(detector.load_ms, 2)
-            job.lifecycle["text_encode_ms"] = round(text_encode_ms, 2)
-            job.lifecycle["share_detector"] = lifecycle.share_detector
+            detector_name = ""
+            if share_detector:
+                detector = build_detector(self.config, backend, pairings[0].detector)
+                detector.load()
+                detector_name = pairings[0].detector
+                text_encode_ms = detector.set_prompts(run.prompts, run.threshold)
+                job.lifecycle["detector_load_ms"] = round(detector.load_ms, 2)
+                job.lifecycle["text_encode_ms"] = round(text_encode_ms, 2)
+            job.lifecycle["share_detector"] = share_detector
 
             if lifecycle.preload_all_models:
-                for pairing in PAIRINGS:
+                for pairing in pairings:
                     seg = build_segmenter(self.config, backend, pairing.segmenter)
                     seg.load()
                     segmenters[pairing.pairing_id] = seg
                 job.lifecycle["preloaded"] = True
 
             swap_start: float | None = None
-            for pairing in PAIRINGS:
+            for pairing in pairings:
                 if cancel.is_set():
                     raise CancelledError("cancelled")
 
                 state = RUNNING_A if pairing.pairing_id == PAIRING_A else RUNNING_B
                 self._transition(job, state)
 
-                if lifecycle.reload_between_runs and detector is not None and summaries:
-                    # Strict isolation: rebuild everything between runs.
-                    detector.unload()
-                    detector = build_detector(self.config, backend)
+                needs_detector = (
+                    detector is None
+                    or pairing.detector != detector_name
+                    or (lifecycle.reload_between_runs and summaries)
+                )
+                if needs_detector:
+                    if detector is not None:
+                        detector.unload()
+                    detector = build_detector(self.config, backend, pairing.detector)
                     detector.load()
+                    detector_name = pairing.detector
                     text_encode_ms = detector.set_prompts(run.prompts, run.threshold)
+                    job.lifecycle.setdefault("detector_load_ms", round(detector.load_ms, 2))
+                    job.lifecycle.setdefault("text_encode_ms", round(text_encode_ms, 2))
 
                 segmenter = segmenters.get(pairing.pairing_id)
                 if segmenter is None:

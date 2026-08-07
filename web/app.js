@@ -17,14 +17,26 @@ const STAGE_META = [
   { key: 'postprocess', label: 'Postprocess',  color: '#64748b' },
 ];
 
+/* running_a / running_b are relabelled per job from whichever pairings the
+   run actually selected -- see stepName(). */
 const STEPS = [
   { key: 'upload',          name: 'Upload' },
   { key: 'validating',      name: 'Validate' },
-  { key: 'running_a',       name: 'NanoOWL + NanoSAM' },
-  { key: 'running_b',       name: 'NanoOWL + EfficientViT-SAM' },
+  { key: 'running_a',       name: 'Pairing A' },
+  { key: 'running_b',       name: 'Pairing B' },
   { key: 'aggregating',     name: 'Aggregate' },
   { key: 'rendering_video', name: 'Comparison video' },
 ];
+
+function stepName(step, job) {
+  const slot = step.key === 'running_a' ? 'a' : step.key === 'running_b' ? 'b' : null;
+  if (!slot) return step.name;
+  const specId = ((job && job.lifecycle && job.lifecycle.pairings) || {})[slot]
+    || (job && job.run_config && job.run_config[`pairing_${slot}`]);
+  const catalogue = (state.serverConfig && state.serverConfig.pairing_catalogue) || [];
+  const spec = catalogue.find((s) => s.id === specId);
+  return spec ? spec.label : step.name;
+}
 const STATE_INDEX = {
   queued: 0, validating: 1, running_a: 2, running_b: 3,
   aggregating: 4, rendering_video: 5,
@@ -138,7 +150,11 @@ function startBenchmark() {
   if (!state.file || state.uploading) return;
   const prompts = $('prompts').value.trim();
   if (!prompts) {
-    $('setup-error').textContent = 'NanoOWL needs at least one text prompt.';
+    $('setup-error').textContent = 'Both detectors are open-vocabulary, so they need at least one text prompt.';
+    return;
+  }
+  if ($('pairing-a').value === $('pairing-b').value) {
+    $('setup-error').textContent = 'Pick two different pairings — comparing one against itself measures nothing.';
     return;
   }
 
@@ -150,6 +166,8 @@ function startBenchmark() {
   form.append('max_frames', $('max-frames').value || '');
   form.append('warmup_frames', $('warmup').value || '0');
   form.append('record_masks', $('record-masks').checked ? 'true' : 'false');
+  form.append('pairing_a', $('pairing-a').value);
+  form.append('pairing_b', $('pairing-b').value);
 
   state.uploading = true;
   $('start-btn').disabled = true;
@@ -315,7 +333,7 @@ function renderStepper(job, uploadPct) {
       el('li', { class: cls },
         el('span', { class: 'step-dot', text: STEP_MARK[status] || String(i + 1) }),
         el('span', { class: 'step-text' },
-          el('span', { class: 'step-name', text: step.name }),
+          el('span', { class: 'step-name', text: stepName(step, job) }),
           sub ? el('span', { class: 'step-sub', text: sub }) : null)));
   });
 }
@@ -823,6 +841,45 @@ async function loadHistory() {
   });
 }
 
+/* ── pairing selection ───────────────────────────────────────────────── */
+function populatePairings(config) {
+  const catalogue = config.pairing_catalogue || [];
+  if (!catalogue.length) return;
+  for (const [id, selected] of [['pairing-a', config.default_pairing_a],
+                                ['pairing-b', config.default_pairing_b]]) {
+    const select = $(id);
+    select.innerHTML = '';
+    catalogue.forEach((spec) => {
+      select.appendChild(el('option', {
+        value: spec.id, text: spec.label,
+        title: spec.description,
+        ...(spec.id === selected ? { selected: 'selected' } : {}),
+      }));
+    });
+    select.addEventListener('change', describePairings);
+  }
+  describePairings();
+}
+
+function describePairings() {
+  const a = $('pairing-a'), b = $('pairing-b');
+  const spec = (sel) => (state.serverConfig.pairing_catalogue || [])
+    .find((s) => s.id === sel.value);
+  const [sa, sb] = [spec(a), spec(b)];
+  const note = $('pairing-note');
+  if (!sa || !sb) { note.textContent = ''; return; }
+  if (sa.id === sb.id) {
+    note.textContent = 'Same pairing on both sides — pick two different ones.';
+  } else if (sa.detector === sb.detector) {
+    // The clean ablation: one variable, so the delta is attributable.
+    note.textContent = `Detector held constant (${sa.detector}); only the segmenter differs.`;
+  } else if (sa.segmenter === sb.segmenter) {
+    note.textContent = `Segmenter held constant (${sa.segmenter}); only the detector differs.`;
+  } else {
+    note.textContent = 'Detector AND segmenter differ — the gap cannot be attributed to either alone.';
+  }
+}
+
 /* ── boot ────────────────────────────────────────────────────────────── */
 async function init() {
   initUpload();
@@ -873,6 +930,7 @@ async function init() {
       badge.className = 'badge badge-live';
       badge.textContent = 'jetson backend';
     }
+    populatePairings(config);
     const d = config.defaults;
     $('prompts').value = d.prompts.join(', ');
     $('threshold').value = d.threshold;

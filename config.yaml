@@ -38,6 +38,15 @@ efficientvit:
   decoder_engine: data/efficientvit_sam_l0_decoder.engine
   device: cuda
 
+# EfficientViT-SAM-L2: larger backbone, same family. Selectable as a pairing.
+efficientvit_l2:
+  model: efficientvit-sam-l2
+  weights: data/efficientvit_sam_l2.pt
+  runtime: auto
+  encoder_engine: data/efficientvit_sam_l2_encoder.engine
+  decoder_engine: data/efficientvit_sam_l2_decoder.engine
+  device: cuda
+
 # Defaults for a run; the UI can override each of these per job.
 run:
   prompts:

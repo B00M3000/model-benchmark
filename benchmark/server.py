@@ -21,7 +21,15 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import REPO_ROOT, AppConfig, load_config
 from .jobs import QUEUED, JobManager
-from .models.registry import PAIRINGS, missing_jetson_modules, resolve_backend
+from .models.registry import (
+    DEFAULT_SPEC_A,
+    DEFAULT_SPEC_B,
+    PAIRING_CATALOGUE,
+    PAIRINGS,
+    SPEC_BY_ID,
+    missing_jetson_modules,
+    resolve_backend,
+)
 from .pipeline import RunConfig
 
 ALLOWED_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -66,6 +74,20 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 }
                 for p in PAIRINGS
             ],
+            # Everything a run may put in a slot, so the UI can offer the
+            # whole grid rather than the default pair alone.
+            "pairing_catalogue": [
+                {
+                    "id": s.spec_id,
+                    "label": s.label,
+                    "detector": s.detector,
+                    "segmenter": s.segmenter,
+                    "description": s.description,
+                }
+                for s in PAIRING_CATALOGUE
+            ],
+            "default_pairing_a": DEFAULT_SPEC_A,
+            "default_pairing_b": DEFAULT_SPEC_B,
             "defaults": config.run.model_dump(),
             "lifecycle": config.lifecycle.model_dump(),
             "video_enabled": config.video.enabled,
@@ -86,6 +108,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         max_frames: str = Form(""),
         warmup_frames: int = Form(None),
         record_masks: str = Form("true"),
+        pairing_a: str = Form(""),
+        pairing_b: str = Form(""),
     ) -> dict[str, Any]:
         suffix = Path(video.filename or "input.mp4").suffix.lower()
         if suffix not in ALLOWED_SUFFIXES:
@@ -115,7 +139,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 0, config.run.warmup_frames if warmup_frames is None else int(warmup_frames)
             ),
             record_masks=str(record_masks).lower() in {"1", "true", "yes", "on"},
+            pairing_a=pairing_a or DEFAULT_SPEC_A,
+            pairing_b=pairing_b or DEFAULT_SPEC_B,
         )
+        for slot, spec_id in (("pairing_a", run.pairing_a), ("pairing_b", run.pairing_b)):
+            if spec_id not in SPEC_BY_ID:
+                raise HTTPException(
+                    400,
+                    f"Unknown {slot} {spec_id!r}. Available: "
+                    + ", ".join(sorted(SPEC_BY_ID)),
+                )
 
         job, target = manager.create(video.filename or "input.mp4", suffix, run)
         limit = config.server.max_upload_mb * 1024 * 1024

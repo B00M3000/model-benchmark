@@ -47,6 +47,11 @@ class RunConfig:
     max_frames: int | None = None
     warmup_frames: int = 10
     record_masks: bool = True
+    #: Which catalogue entries occupy the two comparison slots. Empty means
+    #: the registry defaults; resolved in jobs.py so a saved job records
+    #: exactly what ran.
+    pairing_a: str = ""
+    pairing_b: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +61,8 @@ class RunConfig:
             "max_frames": self.max_frames,
             "warmup_frames": self.warmup_frames,
             "record_masks": self.record_masks,
+            "pairing_a": self.pairing_a,
+            "pairing_b": self.pairing_b,
         }
 
 

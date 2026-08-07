@@ -234,5 +234,51 @@ else
   "$PYTHON" -m pip install triton
 fi
 
+# ── YOLO-World-S ─────────────────────────────────────────────────────────
+# The second detector. Set SKIP_YOLOWORLD=1 to leave it out -- nothing in
+# the default NanoOWL pairings needs any of the three installs below.
+#
+# ultralytics declares torch, torchvision AND opencv-python as hard
+# dependencies, so --no-deps is doubly required here: the first two would
+# replace JetPack's builds (the failure this whole script exists to avoid),
+# and opencv-python would shadow JetPack's cv2, which is the one built with
+# CUDA and GStreamer. Its remaining dependencies are installed by name
+# below.
+SKIP_YOLOWORLD="${SKIP_YOLOWORLD:-0}"
+if [[ "$SKIP_YOLOWORLD" == "1" ]]; then
+  log "SKIP_YOLOWORLD=1 -- skipping ultralytics, CLIP and their dependencies"
+else
+  log "ultralytics (YOLO-World-S detector)"
+  if "$PYTHON" -c 'from ultralytics import YOLOWorld' >/dev/null 2>&1; then
+    ok "already importable"
+  else
+    "$PYTHON" -m pip install ultralytics --no-deps
+  fi
+
+  # ultralytics' own dependencies, minus torch/torchvision/opencv-python.
+  # numpy is already pinned <2 above and pillow/pyyaml/requests usually come
+  # in with transformers, but naming them all keeps this independent of
+  # what happened to be installed first.
+  log "ultralytics' safe dependencies (no torch, no opencv-python)"
+  "$PYTHON" -m pip install \
+    filelock matplotlib pillow pyyaml requests psutil polars \
+    nvidia-ml-py ultralytics-thop
+
+  # CLIP encodes the text prompts inside YOLOWorld.set_classes(). This is
+  # NOT optional and it must be installed HERE, ahead of time: ultralytics
+  # falls back to running `pip install git+.../CLIP.git` itself at the
+  # moment set_classes is first called, without --no-deps -- so a missing
+  # CLIP means PyPI torch landing on top of JetPack's build in the middle
+  # of a benchmark run. CLIP declares torch and torchvision too, hence
+  # --no-deps and its own three dependencies by name.
+  log "CLIP (encodes YOLO-World's prompts; pre-installed so ultralytics never self-installs it)"
+  if "$PYTHON" -c 'import clip' >/dev/null 2>&1; then
+    ok "already importable"
+  else
+    "$PYTHON" -m pip install "git+https://github.com/ultralytics/CLIP.git" --no-deps
+    "$PYTHON" -m pip install ftfy regex tqdm
+  fi
+fi
+
 log "Verifying"
 "$PYTHON" scripts/doctor.py

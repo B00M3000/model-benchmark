@@ -49,13 +49,19 @@ class MockDetector(Detector):
         jitter_ms: float = 1.5,
         max_objects: int = 3,
         seed: int = 0,
+        label: str = "mock detector",
+        split_stages: bool = True,
     ) -> None:
         super().__init__()
         self.encode_ms = encode_ms
         self.decode_ms = decode_ms
         self.jitter_ms = jitter_ms
         self.max_objects = max_objects
-        self.variant = "mock detector (synthetic latency)"
+        # YOLO-World runs one forward pass with no encode/decode seam, so
+        # its mock must not report a split either -- otherwise the stage
+        # chart shows a breakdown the real backend can never produce.
+        self.split_stages = split_stages
+        self.variant = f"{label} (synthetic latency)"
         self._prompts: list[str] = []
         self._seed = seed
         self._rng = np.random.default_rng(seed)
@@ -79,10 +85,16 @@ class MockDetector(Detector):
     def detect(self, frame_rgb: np.ndarray, timer: StageTimer) -> list[Detection]:
         height, width = frame_rgb.shape[:2]
         with timer.stage(STAGE_DETECT, sync=False):
-            with timer.stage(STAGE_DETECT_ENCODE, sync=False):
-                _busy_sleep(self.encode_ms + float(self._rng.normal(0, self.jitter_ms)))
-            with timer.stage(STAGE_DETECT_DECODE, sync=False):
-                _busy_sleep(self.decode_ms + float(self._rng.normal(0, self.jitter_ms / 3)))
+            if self.split_stages:
+                with timer.stage(STAGE_DETECT_ENCODE, sync=False):
+                    _busy_sleep(self.encode_ms + float(self._rng.normal(0, self.jitter_ms)))
+                with timer.stage(STAGE_DETECT_DECODE, sync=False):
+                    _busy_sleep(self.decode_ms + float(self._rng.normal(0, self.jitter_ms / 3)))
+            else:
+                _busy_sleep(
+                    self.encode_ms + self.decode_ms
+                    + float(self._rng.normal(0, self.jitter_ms))
+                )
 
         # Deterministic in the frame index so both pairings see comparable
         # object counts, with a couple of frames left empty on purpose to
