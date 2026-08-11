@@ -366,7 +366,7 @@ def test_a_stale_companion_is_replaced_with_one_matching_torch(ft, monkeypatch):
     monkeypatch.setattr(ft, "pip", lambda *a: installed.append(a) or True)
     monkeypatch.delenv("TORCH_INDEX_URL", raising=False)
 
-    assert ft.repair_companions(torch_probe) is True
+    assert ft.repair_companions(torch_probe) == []   # nothing left unresolved
     assert installed == [(
         "install", "--no-cache-dir", "--no-deps",
         "--index-url", "https://pypi.jetson-ai-lab.io/jp6/cu126",
@@ -381,14 +381,14 @@ def test_a_missing_companion_is_not_installed(ft, monkeypatch):
 
     torch_probe = ft.Probe(ok=True, version="2.11.0", cuda_build="12.6",
                            path="/venv/torch/__init__.py")
-    assert ft.repair_companions(torch_probe) is False
+    assert ft.repair_companions(torch_probe) == []
 
 
 def test_companions_are_not_touched_while_torch_itself_is_broken(ft, monkeypatch):
     """Until torch imports, every companion fails for torch's reason and
     nothing can be told apart."""
     monkeypatch.setattr(ft, "probe_module", lambda py, name: pytest.fail("too early"))
-    assert ft.repair_companions(ft.Probe(error=CONTAINER_ERROR)) is False
+    assert ft.repair_companions(ft.Probe(error=CONTAINER_ERROR)) == []
 
 
 def test_torch_local_version_does_not_leak_into_the_pin(ft, monkeypatch):
@@ -406,6 +406,132 @@ def test_torch_local_version_does_not_leak_into_the_pin(ft, monkeypatch):
     ft.repair_companions(ft.Probe(ok=True, version="2.11.0+cu126",
                                   cuda_build="12.6", path="/venv/torch/__init__.py"))
     assert installed[0][-1] == "torchvision==2.11.*"
+
+
+def test_versions_are_parsed_from_pip_index(ft, monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0,
+        stdout="torchaudio (2.10.0)\nAvailable versions: 2.10.0, 2.9.1, 2.8.0\n",
+        stderr=""))
+    assert ft.available_versions("torchaudio", "https://x") == ["2.10.0", "2.9.1", "2.8.0"]
+
+
+def test_versions_are_parsed_from_the_resolver_error(ft, monkeypatch):
+    """The fallback, and the message that revealed the problem: pip lists what
+    it *could* have installed when the pin matches nothing."""
+    import subprocess
+
+    calls: list[list] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "index" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such command")
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="",
+            stderr="ERROR: Could not find a version that satisfies the requirement "
+                   "torchaudio==99999 (from versions: 2.8.0, 2.9.1, 2.10.0)\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # Newest first, regardless of the order pip happened to print.
+    assert ft.available_versions("torchaudio", "https://x") == ["2.10.0", "2.9.1", "2.8.0"]
+    assert len(calls) == 2
+
+
+def test_versions_survive_an_index_that_says_nothing(ft, monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 1, stdout="", stderr="connection refused"))
+    assert ft.available_versions("torch", "https://x") == []
+
+
+@pytest.mark.parametrize(
+    "torch_series, expected",
+    [("2.11", "0.26"), ("2.10", "0.25"), ("2.8", "0.23"), ("2.5", "0.20")],
+)
+def test_torchvision_series_tracks_torch(ft, torch_series, expected):
+    assert ft.torchvision_series(torch_series) == expected
+
+
+def test_trio_moves_to_the_newest_series_the_index_has_all_of(ft, monkeypatch):
+    """The real case: the Jetson index publishes torch 2.11.0 but no
+    torchaudio past 2.10.0, so no companion can ever match torch and torch is
+    the version that has to give."""
+    index_has = {
+        "torch": ["2.11.0", "2.10.0", "2.9.1", "2.8.0"],
+        "torchvision": ["0.26.0", "0.25.0", "0.24.1", "0.23.0"],
+        "torchaudio": ["2.10.0", "2.9.1", "2.8.0"],
+    }
+    installed: list[tuple] = []
+    monkeypatch.setattr(ft, "available_versions", lambda name, index: index_has[name])
+    monkeypatch.setattr(ft, "pip", lambda *a: installed.append(a) or True)
+    monkeypatch.setattr(ft, "probe_torch", lambda py: ft.Probe(
+        ok=True, version="2.10.0", cuda_build="12.6", path="/venv/torch/__init__.py",
+        cuda_available=True))
+    monkeypatch.delenv("TORCH_INDEX_URL", raising=False)
+
+    probe = ft.Probe(ok=True, version="2.11.0", cuda_build="12.6",
+                     path="/venv/torch/__init__.py", cuda_available=True)
+    assert ft.align_trio(probe) is True
+    assert installed[0][-3:] == ("torch==2.10.*", "torchvision==0.25.*", "torchaudio==2.10.*")
+    assert "--force-reinstall" in installed[0]
+
+
+def test_trio_skips_a_series_missing_a_torchvision(ft, monkeypatch):
+    index_has = {
+        "torch": ["2.11.0", "2.10.0"],
+        "torchvision": ["0.26.0"],           # nothing for torch 2.10
+        "torchaudio": ["2.10.0"],            # nothing for torch 2.11
+    }
+    monkeypatch.setattr(ft, "available_versions", lambda name, index: index_has[name])
+    monkeypatch.setattr(ft, "pip", lambda *a: pytest.fail("must not install"))
+
+    probe = ft.Probe(ok=True, version="2.11.0", cuda_build="12.6",
+                     path="/venv/torch/__init__.py")
+    assert ft.align_trio(probe) is False
+
+
+def test_trio_only_installs_companions_when_torch_is_already_right(ft, monkeypatch):
+    """Re-downloading a 232 MB torch that is already the chosen version is
+    pure waste."""
+    index_has = {
+        "torch": ["2.10.0"], "torchvision": ["0.25.0"], "torchaudio": ["2.10.0"],
+    }
+    installed: list[tuple] = []
+    monkeypatch.setattr(ft, "available_versions", lambda name, index: index_has[name])
+    monkeypatch.setattr(ft, "pip", lambda *a: installed.append(a) or True)
+    monkeypatch.setattr(ft, "probe_torch", lambda py: ft.Probe(
+        ok=True, version="2.10.0", cuda_build="12.6", path="/venv/torch/__init__.py"))
+
+    probe = ft.Probe(ok=True, version="2.10.0", cuda_build="12.6",
+                     path="/venv/torch/__init__.py")
+    assert ft.align_trio(probe) is True
+    assert installed[0][-2:] == ("torchvision==0.25.*", "torchaudio==2.10.*")
+    assert not any(p.startswith("torch==") for p in installed[0])
+
+
+def test_trio_reports_an_unreachable_index_rather_than_guessing(ft, monkeypatch):
+    monkeypatch.setattr(ft, "available_versions", lambda name, index: [])
+    monkeypatch.setattr(ft, "pip", lambda *a: pytest.fail("must not install"))
+
+    probe = ft.Probe(ok=True, version="2.11.0", cuda_build="12.6",
+                     path="/venv/torch/__init__.py")
+    assert ft.align_trio(probe) is False
+
+
+def test_an_unmatchable_companion_is_flagged_for_realignment(ft, monkeypatch):
+    """repair_companions returns what it could not fix; that is the signal to
+    move torch rather than keep trying to match it."""
+    monkeypatch.setattr(ft, "COMPANIONS", ("torchaudio",))
+    monkeypatch.setattr(ft, "probe_module", lambda py, name: ft.Probe(error=TORCHAUDIO_STALE))
+    monkeypatch.setattr(ft, "pip", lambda *a: False)  # index has no matching version
+
+    probe = ft.Probe(ok=True, version="2.11.0", cuda_build="12.6",
+                     path="/venv/torch/__init__.py")
+    assert ft.repair_companions(probe) == ["torchaudio"]
 
 
 def test_index_follows_torchs_cuda_not_the_drivers(ft, monkeypatch):

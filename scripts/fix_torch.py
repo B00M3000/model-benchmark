@@ -447,6 +447,121 @@ def wheel_index(cuda_build: str | None) -> str:
         "TORCH_INDEX_URL", f"https://pypi.jetson-ai-lab.io/jp6/{tag}")
 
 
+VERSIONS_LINE = re.compile(r"(?:Available versions|from versions):\s*([^)\n]+)")
+
+
+def version_key(version: str) -> tuple:
+    parts = version.split("+")[0].split(".")
+    return tuple(int(p) if p.isdigit() else 0 for p in parts[:3])
+
+
+def series_of(version: str) -> str:
+    """'2.10.0+cu126' -> '2.10'. What a companion has to match."""
+    return ".".join(version.split("+")[0].split(".")[:2])
+
+
+def available_versions(package: str, index: str) -> list[str]:
+    """Versions of `package` the index publishes, newest first.
+
+    `pip index versions` is the documented route and is flagged experimental,
+    so there is a fallback: the resolver's own failure carries the same list
+    ("from versions: 2.8.0, 2.9.1, 2.10.0"). That message is what revealed the
+    problem in the first place -- the Jetson index publishes torch 2.11.0 but
+    no torchaudio past 2.10.0, so "install the companion matching torch" can
+    never succeed and the version to move is torch's.
+    """
+    for command in (
+        ["index", "versions", package, "--index-url", index],
+        ["install", f"{package}==99999", "--no-deps", "--index-url", index],
+    ):
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", *command],
+            capture_output=True, text=True,
+        )
+        match = VERSIONS_LINE.search(result.stdout + result.stderr)
+        if match:
+            found = [v.strip() for v in match.group(1).split(",") if v.strip()]
+            # Sorted here rather than trusted: `pip index versions` lists
+            # newest first, the error message lists oldest first.
+            return sorted(found, key=version_key, reverse=True)
+    return []
+
+
+def torchvision_series(torch_series: str) -> str:
+    """torch 2.11 -> torchvision 0.26. Fifteen behind, since torch 2.0."""
+    major, minor = torch_series.split(".")
+    return f"0.{int(minor) + 15}" if major == "2" else ""
+
+
+def align_trio(torch_probe: Probe, dry_run: bool = False) -> bool:
+    """Move torch, torchvision and torchaudio to one series the index has all of.
+
+    The last resort, and the only move left when a companion cannot be matched
+    to the installed torch because the index simply does not publish one. That
+    is not a broken environment -- the Jetson index tracks torch ahead of
+    torchaudio -- so no amount of installing companions resolves it. torch is
+    the version that has to give.
+
+    Nothing here uses audio. torchaudio is in the way only because
+    transformers/audio_utils.py does a module-level `import torchaudio` behind
+    is_torchaudio_available(), which tests for metadata rather than for a
+    library that loads -- so a stale copy in system dist-packages, which a
+    read-only container image will not let you remove, fails the import of
+    OwlViTForObjectDetection.
+    """
+    index = wheel_index(torch_probe.cuda_build)
+    print(f"\n{BOLD}--> no companion matches torch {torch_probe.version}; "
+          f"moving the trio to a series the index has all of{RESET}")
+
+    have = {name: available_versions(name, index)
+            for name in ("torch", "torchvision", "torchaudio")}
+    for name, versions in have.items():
+        ok(f"{name} on the index", ", ".join(versions[:6]) or "none found")
+    if not all(have.values()):
+        bad("could not read the index", f"tried {index}")
+        return False
+
+    audio_series = {series_of(v) for v in have["torchaudio"]}
+    vision_series = {series_of(v) for v in have["torchvision"]}
+
+    chosen = None
+    for version in have["torch"]:
+        series = series_of(version)
+        if series in audio_series and torchvision_series(series) in vision_series:
+            chosen = series
+            break
+    if chosen is None:
+        bad("no series has all three", "torch, torchvision and torchaudio do "
+                                      "not overlap on this index")
+        return False
+
+    pins = [f"torch=={chosen}.*", f"torchvision=={torchvision_series(chosen)}.*",
+            f"torchaudio=={chosen}.*"]
+    if series_of(torch_probe.version) == chosen:
+        ok(f"torch is already on {chosen}", "installing the companions only")
+        pins = pins[1:]
+    else:
+        warn(f"torch {torch_probe.version} -> {chosen}.*",
+             f"the newest series this index publishes a torchaudio for")
+
+    if dry_run:
+        warn("--dry-run: would install " + " ".join(pins))
+        return False
+
+    # --force-reinstall so a version already present but wrong is replaced
+    # rather than considered satisfied; --no-deps so this stays three wheels.
+    if not pip("install", "--no-cache-dir", "--force-reinstall", "--no-deps",
+               "--index-url", index, *pins):
+        return False
+
+    after = probe_torch(sys.executable)
+    if not after.ok:
+        bad("torch does not import after realignment", after.error)
+        return False
+    ok("torch imports", after.describe())
+    return True
+
+
 def repair_companions(torch_probe: Probe, dry_run: bool = False) -> bool:
     """Replace companions left over from a torch that is no longer here.
 
@@ -457,14 +572,17 @@ def repair_companions(torch_probe: Probe, dry_run: bool = False) -> bool:
     and copes when it is not, so a missing companion is left missing --
     installing one nothing asked for is how you acquire the next mismatch.
     Only a companion that is present and refuses to load gets touched.
+
+    Returns the companions still broken afterwards, which is the signal to
+    realign the whole trio instead.
     """
     if not torch_probe.ok:
-        return False
+        return []
 
     # torch 2.11.0 -> torchvision/torchaudio 2.11.*: the trio is released in
     # lockstep and a companion only loads against its own torch minor.
-    series = ".".join(torch_probe.version.split("+")[0].split(".")[:2])
-    repaired = False
+    series = series_of(torch_probe.version)
+    unresolved: list[str] = []
 
     for name in COMPANIONS:
         probe = probe_module(sys.executable, name)
@@ -478,7 +596,8 @@ def repair_companions(torch_probe: Probe, dry_run: bool = False) -> bool:
         bad(f"{name} does not load", probe.error)
         index = wheel_index(torch_probe.cuda_build)
         if dry_run:
-            warn(f"--dry-run: would install {name}~={series} from {index}")
+            warn(f"--dry-run: would install {name}=={series}.* from {index}")
+            unresolved.append(name)
             continue
 
         # Into the venv, where it shadows the stale copy -- which usually sits
@@ -486,18 +605,19 @@ def repair_companions(torch_probe: Probe, dry_run: bool = False) -> bool:
         # container image, can write to.
         if not pip("install", "--no-cache-dir", "--no-deps",
                    "--index-url", index, f"{name}=={series}.*"):
-            bad(f"could not install a matching {name}",
-                f"remove the stale copy instead: it is at {probe.raw.get('path') or 'the path above'}")
+            warn(f"the index publishes no {name} {series}.*",
+                 "torch is ahead of its companions here; realigning below")
+            unresolved.append(name)
             continue
 
         after = probe_module(sys.executable, name)
         if after.ok:
             ok(f"{name} loads", f"{after.version}  {after.path}")
-            repaired = True
         else:
             bad(f"{name} still does not load", after.error)
+            unresolved.append(name)
 
-    return repaired
+    return unresolved
 
 
 def main() -> int:
@@ -509,7 +629,11 @@ def main() -> int:
     print(f"{BOLD}torch{RESET}")
     probe = resolve(dry_run=args.dry_run)
     if probe.ok:
-        repair_companions(probe, dry_run=args.dry_run)
+        unresolved = repair_companions(probe, dry_run=args.dry_run)
+        if unresolved and not args.dry_run and align_trio(probe):
+            # Realigning moved torch, so the companions are re-checked against
+            # the version that is actually installed now.
+            repair_companions(probe_torch(sys.executable))
         return 0
 
     print()

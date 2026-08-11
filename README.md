@@ -909,6 +909,31 @@ A companion that is simply **absent** is left absent: `transformers` asks
 whether `torchaudio` is available and copes when it is not, so installing one
 nothing asked for only acquires the next mismatch.
 
+**When no matching companion exists**, torch is the version that has to give:
+
+```
+ERROR: Could not find a version that satisfies the requirement torchaudio==2.11.*
+       (from versions: 2.8.0, 2.9.1, 2.10.0)
+```
+
+The Jetson index tracks torch ahead of its companions — it publishes torch
+2.11.0 and no torchaudio past 2.10.0 — so "install the companion matching
+torch" can never succeed. `fix_torch.py` then reads the index, picks the newest
+series publishing all three (torch 2.10 / torchvision 0.25 / torchaudio 2.10),
+and installs the set together.
+
+Which is also why `doctor.py --fix` alone can leave you here: it installs the
+newest torch the index has, without checking that the companions exist at that
+version. Running `setup_jetson.sh` afterwards realigns them.
+
+Why torchaudio is load-bearing at all, given nothing here touches audio:
+`transformers/audio_utils.py` does a module-level `import torchaudio` behind
+`is_torchaudio_available()`, and that helper tests for installed *metadata*,
+not for a library that loads. A stale copy therefore always passes the guard
+and always fails the import — and it cannot be made to look absent from inside
+the venv, because `find_spec` and the `.dist-info` both still resolve to the
+system copy.
+
 ### CLIP installs as "UNKNOWN-0.0.0" and `import clip` still fails
 
 pip reports success and nothing works:
