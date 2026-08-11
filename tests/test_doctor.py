@@ -108,11 +108,88 @@ def test_cascade_can_be_reported_as_a_warning(doctor):
     """The optional runtimes (nanosam.mobile_sam, ultralytics) must not turn
     into hard blockers just because torchvision took them down with it."""
     doctor._torchvision_failed = True
-    doctor.report_cascade("ultralytics not importable", doctor.warn)
+    doctor.report_cascade(
+        "ultralytics not importable", doctor.TORCHVISION_CASCADE, doctor.warn)
 
     assert doctor._problems == []
     assert doctor._warnings == ["ultralytics not importable"]
     assert doctor._cascaded == ["ultralytics not importable"]
+
+
+CUDSS = ("ImportError: libcudss.so.0: cannot open shared object file: "
+         "No such file or directory")
+
+
+@pytest.fixture
+def torch_import_raises(monkeypatch):
+    """Make a bare `import torch` fail with whatever error the test wants."""
+
+    def install(message: str):
+        class ExplodingFinder:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "torch":
+                    raise ImportError(message)
+                return None
+
+        monkeypatch.delitem(sys.modules, "torch", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [ExplodingFinder(), *sys.meta_path])
+
+    return install
+
+
+def test_a_torch_that_cannot_load_a_library_is_not_reported_as_missing(
+        doctor, monkeypatch, torch_import_raises, capsys):
+    """"torch is not installed" and "torch is installed but cannot load
+    libcudss" are the same ImportError and opposite problems. The old message
+    sent you to add --system-site-packages to the venv while torch sat right
+    there, fully installed and intact."""
+    monkeypatch.setattr(doctor, "cuda_driver_version", lambda: 12060)
+    torch_import_raises(
+        "libcudss.so.0: cannot open shared object file: No such file or directory")
+
+    doctor.check_torch()
+
+    assert doctor._problems == ["torch cannot load a library it was built against"]
+    assert doctor._torch_missing_lib == "libcudss.so.0"
+    out = capsys.readouterr().out
+    assert "fix_torch.py" in out
+    assert "--system-site-packages" not in out
+
+
+def test_a_genuinely_absent_torch_still_says_so(
+        doctor, monkeypatch, torch_import_raises, capsys):
+    monkeypatch.setattr(doctor, "cuda_driver_version", lambda: 12060)
+    torch_import_raises("No module named 'torch'")
+
+    doctor.check_torch()
+
+    assert doctor._problems == ["torch not importable"]
+    assert doctor._torch_missing_lib is None
+    assert "--system-site-packages" in capsys.readouterr().out
+
+
+def test_libcudss_failures_downstream_are_attributed_to_torch(doctor):
+    """Every importer of torch re-raises the loader error verbatim, so
+    transformers, ultralytics and efficientvit all fail with the identical
+    message and read as three unrelated broken packages."""
+    doctor._torch_missing_lib = "libcudss.so.0"
+
+    reason = doctor.cascade_reason(ImportError(CUDSS))
+    assert reason is not None
+    assert "libcudss.so.0" in reason
+    assert "fix torch" in reason
+
+
+def test_unrelated_failures_are_not_blamed_on_the_missing_library(doctor):
+    doctor._torch_missing_lib = "libcudss.so.0"
+    assert doctor.cascade_reason(
+        ModuleNotFoundError("No module named 'pycocotools'", name="pycocotools")) is None
+
+
+def test_cascade_reason_is_silent_when_nothing_upstream_failed(doctor):
+    assert doctor.cascade_reason(ImportError(CUDSS)) is None
+    assert doctor.cascade_reason(ModuleNotFoundError(
+        "No module named 'torchvision'", name="torchvision")) is None
 
 
 def test_run_checks_clears_cascade_state(doctor, monkeypatch):

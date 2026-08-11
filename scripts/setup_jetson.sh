@@ -124,6 +124,41 @@ else
   "$PYTHON" -m pip install "packaging>=24.2"
 fi
 
+# The other half of the same class of problem, from the opposite direction.
+# Ubuntu 22.04 -- and so every stock JetPack image and container built on it --
+# ships setuptools 59.6.0, which predates PEP 621: it does not read a
+# [project] table at all. Building a project that has one then succeeds and
+# produces a package named UNKNOWN, version 0.0.0, containing nothing:
+#
+#     Building wheel for UNKNOWN (pyproject.toml) ... done
+#     Created wheel for UNKNOWN: filename=UNKNOWN-0.0.0-py3-none-any.whl size=12921
+#     Successfully installed UNKNOWN-0.0.0
+#
+# pip reports success, `import clip` then fails, and the 12 KB is the giveaway
+# -- the real wheel is 1.4 MB, nearly all of it the BPE vocabulary. CLIP is
+# built from git here and declares [project], so it hits this exactly.
+# setuptools 61 added PEP 621; CLIP's own build-system asks for >=70.
+log "setuptools (Ubuntu 22.04's 59.6.0 builds [project] packages as UNKNOWN-0.0.0)"
+if "$PYTHON" -c 'import setuptools; assert int(setuptools.__version__.split(".")[0]) >= 70' 2>/dev/null; then
+  ok "already new enough"
+else
+  "$PYTHON" -m pip install -U "setuptools>=70" wheel
+fi
+
+# Clean up after a previous run that hit the above. Left installed, this
+# occupies the name pip checks and hides the real package.
+if "$PYTHON" -m pip show UNKNOWN >/dev/null 2>&1; then
+  warn "removing a stray UNKNOWN-0.0.0 left by an earlier failed build"
+  "$PYTHON" -m pip uninstall -y UNKNOWN
+fi
+
+# torch has to import before anything below is meaningful -- every repo here
+# imports it at install time or first use. Not an install step: see the module
+# docstring for why installing a torch is the wrong move when one is already
+# present but built for a different environment.
+log "torch must actually import"
+"$PYTHON" scripts/fix_torch.py || warn "torch is still not importable -- see above"
+
 MODULES_TSV="$("$PYTHON" - <<PYEOF
 import sys
 sys.path.insert(0, "$REPO_ROOT")
@@ -358,7 +393,14 @@ else
   if "$PYTHON" -c 'import clip' >/dev/null 2>&1; then
     ok "already importable"
   else
-    "$PYTHON" -m pip install "git+https://github.com/ultralytics/CLIP.git" --no-deps
+    # --no-build-isolation is what makes the setuptools pin above take effect.
+    # With isolation, pip builds in a temp prefix whose sys.path the system
+    # dist-packages still shadow, so Ubuntu's setuptools 59.6.0 can win over
+    # the >=70 that CLIP's build-system asked for -- silently, producing
+    # UNKNOWN-0.0.0. Without isolation the build uses the venv's setuptools,
+    # which is the one just verified.
+    "$PYTHON" -m pip install "git+https://github.com/ultralytics/CLIP.git" \
+      --no-deps --no-build-isolation
     "$PYTHON" -m pip install ftfy regex tqdm
     if "$PYTHON" -c 'import clip' >/dev/null 2>&1; then
       ok "installed"

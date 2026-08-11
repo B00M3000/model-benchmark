@@ -822,6 +822,85 @@ of the wheel (`sudo apt install python3-opencv`, plus `--system-site-packages`
 on the venv), or pin `opencv-python-headless==4.10.0.84`, the last release that
 resolves against NumPy 1.x.
 
+### "libcudss.so.0: cannot open shared object file" (or any `lib*.so` torch links)
+
+torch is installed, intact, and unimportable — and so is everything that
+imports it:
+
+```
+✗ torch not importable
+✗ transformers import failed              libcudss.so.0: cannot open shared object file
+✗ efficientvit...sam import failed        ImportError: libcudss.so.0: ...
+✗ torch2trt failed to import              ImportError: libcudss.so.0: ...
+```
+
+**One venv, two environments.** This project's `.venv` lives inside the working
+tree, so the same venv is used on the Jetson host *and* inside a
+Singularity/Docker image bind-mounted over that tree:
+
+```bash
+singularity exec --nv -B /run ~/jetson_6_2.sif /bin/bash
+source .venv/bin/activate      # <-- the host's venv, inside the container
+```
+
+A driver-matched torch installed into the venv to repair the host links
+libraries the container image need not carry. Newer builds (torch ≥ 2.9) link
+cuDSS; JetPack images and slim containers often do not ship it.
+
+Installing another torch is the obvious move and the wrong one — it repairs
+whichever environment is running and re-breaks the other on the next switch.
+Resolve one instead:
+
+```bash
+python3 scripts/fix_torch.py          # --dry-run to diagnose without changing anything
+```
+
+It probes the copies already present and stops at the first that imports:
+
+1. **Use the environment's own torch.** If the venv has its own torch and the
+   interpreter the venv was built from has a working one, the venv copy is
+   removed — torchvision with it, always, since a venv torchvision shadowing an
+   inherited torch is the `nms` error above. This is the usual answer, and the
+   only one that removes the mismatch rather than layering over it.
+2. **Supply the missing library.** `pip install nvidia-cudss-cu12 --no-deps`,
+   then symlink the `.so` into `torch/lib` — which is on torch's `_C` RPATH as
+   `$ORIGIN/lib`, so the loader finds it without `LD_LIBRARY_PATH` and
+   regardless of which `nvidia/*/lib` a given build has baked in.
+
+Both scripts run it automatically, so `./scripts/setup_jetson.sh` and
+`./scripts/build_engines.sh` each cope with the switch on their own.
+
+### CLIP installs as "UNKNOWN-0.0.0" and `import clip` still fails
+
+pip reports success and nothing works:
+
+```
+Building wheel for UNKNOWN (pyproject.toml) ... done
+Created wheel for UNKNOWN: filename=UNKNOWN-0.0.0-py3-none-any.whl size=12921
+Successfully installed UNKNOWN-0.0.0
+```
+
+The size gives it away: the real wheel is 1.4 MB, nearly all of it CLIP's BPE
+vocabulary. 12 KB is an empty package.
+
+Ubuntu 22.04 — so every stock JetPack image and most containers built on it —
+ships **setuptools 59.6.0**, which predates PEP 621 and does not read a
+`[project]` table at all. CLIP declares its name and version only there, so
+setuptools falls back to `UNKNOWN` / `0.0.0` and builds nothing. PEP 621 landed
+in setuptools 61; CLIP's own `build-system` asks for ≥ 70 — but with build
+isolation, system `dist-packages` can still shadow the isolated copy, so asking
+is not getting.
+
+```bash
+.venv/bin/pip uninstall -y UNKNOWN
+.venv/bin/pip install -U "setuptools>=70" wheel
+.venv/bin/pip install git+https://github.com/ultralytics/CLIP.git --no-deps --no-build-isolation
+```
+
+`--no-build-isolation` is the part that makes the pin take effect: it builds
+against the venv's setuptools instead of one pip resolved in a temp prefix that
+the system copy can shadow. `setup_jetson.sh` now does all three.
+
 ### doctor reports five problems and four of them are the same one
 
 A report like this is one failure, not five:

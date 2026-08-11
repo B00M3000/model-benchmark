@@ -48,6 +48,16 @@ if [[ -x .venv/bin/python ]]; then
   PYTHON=.venv/bin/python
 fi
 
+# Every step below imports torch, so resolve it before the preflight rather
+# than reporting it. A no-op when torch already imports; when it does not, it
+# is usually because this venv lives in the working tree and is shared between
+# the Jetson host and a container image mounted over it, which need different
+# builds. Running it here too means this script stands alone -- it does not
+# depend on setup_jetson.sh having been run in the same shell.
+if [[ "${SKIP_DOCTOR:-0}" != "1" ]]; then
+  "$PYTHON" scripts/fix_torch.py || true
+fi
+
 # Preflight. Engine builds take minutes and load torch on the way in, so a
 # broken CUDA/torch pairing is worth catching now rather than three steps
 # from here. SKIP_DOCTOR=1 bypasses it.

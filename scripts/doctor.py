@@ -38,10 +38,12 @@ _warnings: list[str] = []
 # (label, callable) for everything --fix knows how to repair. Populated as the
 # checks run, so a fix is only ever offered for a problem actually observed.
 _fixes: list[tuple[str, Callable[[], bool]]] = []
-# Set by check_torchvision when torchvision is missing or unusable. Read by
-# torchvision_cascade() so the checks further down can tell "this package is
-# missing" apart from "this package is fine, torchvision underneath it isn't".
+# Set by check_torchvision when torchvision is missing or unusable, and by
+# check_torch when torch cannot load a shared library it links. Read by
+# cascade_reason() so the checks further down can tell "this package is
+# missing" apart from "this package is fine, what it imports isn't".
 _torchvision_failed = False
+_torch_missing_lib: str | None = None
 
 
 def ok(label: str, detail: str = "") -> None:
@@ -241,6 +243,17 @@ def install_matched_torch(driver: int | None):
     return run
 
 
+# The dynamic loader names the first library it cannot find, then stops.
+MISSING_LIBRARY = re.compile(r"(lib[\w.+-]+\.so[\d.]*): cannot open shared object file")
+
+
+def run_fix_torch() -> bool:
+    return run_fix(
+        "resolve a torch that imports in this environment",
+        [sys.executable, str(REPO_ROOT / "scripts" / "fix_torch.py")],
+    )
+
+
 def installed_version(package_dir: Path) -> str:
     """Version of a package sitting on disk, without importing it.
 
@@ -358,14 +371,34 @@ def check_torch() -> None:
     else:
         ok("CUDA driver", f"supports up to CUDA {fmt_cuda(driver)}")
 
+    global _torch_missing_lib
     try:
         import torch
-    except ImportError:
-        bad(
-            "torch not importable",
-            fix="On the Jetson use a venv created with --system-site-packages so "
-                "JetPack's torch is inherited.",
-        )
+    except ImportError as exc:
+        # "torch is not installed" and "torch is installed but cannot load a
+        # library it links" are the same ImportError and completely different
+        # problems. Conflating them sends you to fix the venv's
+        # --system-site-packages flag when torch is sitting right there, fully
+        # installed, built for an environment that has libcudss.
+        missing = MISSING_LIBRARY.search(str(exc))
+        if missing:
+            _torch_missing_lib = missing.group(1)
+            bad(
+                "torch cannot load a library it was built against",
+                str(exc).splitlines()[0],
+                f"torch is installed and intact; this environment does not carry "
+                f"{_torch_missing_lib}. Usually one venv shared between a Jetson "
+                f"host and a container image over the same working tree.\n    "
+                f"  python3 scripts/fix_torch.py",
+                fix_action=run_fix_torch,
+            )
+        else:
+            bad(
+                "torch not importable",
+                str(exc).splitlines()[0],
+                fix="On the Jetson use a venv created with --system-site-packages "
+                    "so JetPack's torch is inherited.",
+            )
         return
 
     version = torch.__version__
@@ -490,16 +523,16 @@ TORCHVISION_CASCADE = (
     "will not help; repair torchvision and re-run."
 )
 
-# Labels reported only as fallout from a broken torchvision, so the summary can
-# say so instead of presenting five equal-looking problems.
+# Labels reported only as fallout from a broken torch or torchvision, so the
+# summary can say so instead of presenting five equal-looking problems.
 _cascaded: list[str] = []
 
 
-def report_cascade(label: str, severity=None) -> None:
-    """Report `label` as fallout from the torchvision failure, not as its own
-    problem. No fix_action, deliberately: every fix on offer here would
+def report_cascade(label: str, detail: str = TORCHVISION_CASCADE, severity=None) -> None:
+    """Report `label` as fallout from a failure already reported, not as its
+    own problem. No fix_action, deliberately: every fix on offer here would
     reinstall something that is already installed correctly."""
-    (severity or bad)(label, TORCHVISION_CASCADE)
+    (severity or bad)(label, detail)
     _cascaded.append(label)
 
 
@@ -523,6 +556,27 @@ def torchvision_cascade(exc: BaseException) -> bool:
     # not, hence the message fallback.
     name = (getattr(exc, "name", "") or "").split(".")[0]
     return name == "torchvision" or "torchvision" in str(exc)
+
+
+def cascade_reason(exc: BaseException) -> str | None:
+    """Explain `exc` as fallout from an already-reported failure, or None.
+
+    Two root causes reach here. A broken torchvision, above. And a torch that
+    cannot load a shared library it links -- which every importer of torch
+    then re-raises verbatim, so `import transformers`, `import ultralytics`
+    and `import efficientvit...sam` all fail with the identical
+    "libcudss.so.0: cannot open shared object file" and read as three
+    unrelated broken packages.
+    """
+    if _torch_missing_lib and _torch_missing_lib in str(exc):
+        return (
+            f"Installed and fine -- it imports torch, and torch cannot load "
+            f"{_torch_missing_lib} (reported under PyTorch / CUDA above). "
+            f"Reinstalling this package will not help; fix torch and re-run."
+        )
+    if torchvision_cascade(exc):
+        return TORCHVISION_CASCADE
+    return None
 
 
 def check_torchvision(torch, driver: int | None = None) -> None:
@@ -743,6 +797,10 @@ def check_nanoowl_runtime() -> None:
             OwlViTForObjectDetection,
         )
     except ModuleNotFoundError as exc:
+        reason = cascade_reason(exc)
+        if reason:
+            report_cascade("transformers import failed", reason)
+            return
         bad(
             f"{exc.name} not importable",
             "part of transformers' own dependency chain -- NanoOWL needs it "
@@ -753,6 +811,10 @@ def check_nanoowl_runtime() -> None:
         )
         return
     except ImportError as exc:
+        reason = cascade_reason(exc)
+        if reason:
+            report_cascade("transformers import failed", reason)
+            return
         bad(
             "transformers import failed",
             str(exc).splitlines()[0],
@@ -813,8 +875,9 @@ def check_nanosam_runtime() -> None:
     try:
         from nanosam.mobile_sam import sam_model_registry  # noqa: F401
     except ModuleNotFoundError as exc:
-        if torchvision_cascade(exc):
-            report_cascade("nanosam.mobile_sam not importable", warn)
+        reason = cascade_reason(exc)
+        if reason:
+            report_cascade("nanosam.mobile_sam not importable", reason, warn)
             return
         warn(
             f"{exc.name} not importable",
@@ -977,8 +1040,9 @@ def check_efficientvit_runtime() -> None:
         try:
             importlib.import_module(dep.module)
         except ImportError as exc:
-            if torchvision_cascade(exc):
-                report_cascade(f"{dep.module} not importable")
+            reason = cascade_reason(exc)
+            if reason:
+                report_cascade(f"{dep.module} not importable", reason)
             else:
                 bad(
                     f"{dep.module} not importable",
@@ -996,8 +1060,9 @@ def check_efficientvit_runtime() -> None:
     try:
         from efficientvit.models.efficientvit.sam import EfficientViTSamPredictor  # noqa: F401
     except Exception as exc:
-        if torchvision_cascade(exc):
-            report_cascade("efficientvit.models.efficientvit.sam import failed")
+        reason = cascade_reason(exc)
+        if reason:
+            report_cascade("efficientvit.models.efficientvit.sam import failed", reason)
         else:
             bad(
                 "efficientvit.models.efficientvit.sam import failed",
@@ -1015,11 +1080,12 @@ def check_efficientvit_runtime() -> None:
     try:
         from efficientvit.sam_model_zoo import create_efficientvit_sam_model  # noqa: F401
     except Exception as exc:
-        if torchvision_cascade(exc):
+        reason = cascade_reason(exc)
+        if reason:
             # Without this branch the message below accuses upstream of a
             # rename it did not make: the import never got far enough to look
             # for the symbol at all.
-            report_cascade("efficientvit.sam_model_zoo import failed")
+            report_cascade("efficientvit.sam_model_zoo import failed", reason)
         else:
             bad(
                 "efficientvit.sam_model_zoo.create_efficientvit_sam_model missing",
@@ -1092,12 +1158,13 @@ def check_yoloworld_runtime() -> None:
     try:
         from ultralytics import YOLOWorld  # noqa: F401
     except ImportError as exc:
-        if torchvision_cascade(exc):
+        reason = cascade_reason(exc)
+        if reason:
             # ultralytics resolves its declared dependencies at import time, so
             # a torchvision with no metadata raises PackageNotFoundError from
             # inside `import ultralytics` -- which reads as "ultralytics is not
             # installed" when it is installed and undamaged.
-            report_cascade("ultralytics not importable", warn)
+            report_cascade("ultralytics not importable", reason, warn)
             return
         warn(
             "ultralytics not importable",
@@ -1189,6 +1256,10 @@ def check_torch2trt() -> None:
     try:
         import torch2trt
     except Exception as exc:
+        reason = cascade_reason(exc)
+        if reason:
+            report_cascade("torch2trt failed to import", reason)
+            return
         bad("torch2trt failed to import", f"{type(exc).__name__}: {exc}")
         return
 
@@ -1437,8 +1508,9 @@ def run_checks() -> None:
     # Reset alongside _problems/_warnings so the --fix re-check starts clean:
     # left set from the first pass, a repaired torchvision would still be
     # blamed for every later failure.
-    global _torchvision_failed
+    global _torchvision_failed, _torch_missing_lib
     _torchvision_failed = False
+    _torch_missing_lib = None
     _cascaded.clear()
 
     for check in CHECKS:
