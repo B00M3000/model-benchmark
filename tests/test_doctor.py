@@ -192,6 +192,65 @@ def test_cascade_reason_is_silent_when_nothing_upstream_failed(doctor):
         "No module named 'torchvision'", name="torchvision")) is None
 
 
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("/usr/local/lib/python3.10/dist-packages/torchaudio/lib/libtorchaudio.so",
+         "torchaudio"),
+        ("/home/x/.venv/lib/python3.10/site-packages/torchvision/_C.so",
+         "torchvision"),
+        # Not under a packages directory at all -- fall back to the file name
+        # rather than returning a path nobody installed by that name.
+        ("/opt/weird/libtorchaudio.so", "torchaudio"),
+    ],
+)
+def test_the_stale_library_is_named_by_its_package(doctor, path, expected):
+    assert doctor.package_owning(path) == expected
+
+
+def test_a_stale_torchaudio_is_reported_against_torchaudio(doctor, monkeypatch, capsys):
+    """torchaudio's loader raises OSError, not ImportError, so this escaped
+    every handler and landed in run_checks' catch-all as
+    "check_nanoowl_runtime failed" -- naming no package and offering nothing.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def explode(name, *args, **kwargs):
+        if name.startswith("transformers"):
+            raise OSError(
+                "Could not load this library: /usr/local/lib/python3.10/"
+                "dist-packages/torchaudio/lib/libtorchaudio.so")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", explode)
+
+    doctor.check_nanoowl_runtime()
+
+    assert doctor._problems == ["torchaudio was built against a different torch"]
+    out = capsys.readouterr().out
+    assert "libtorchaudio.so" in out
+    assert "fix_torch.py" in out
+
+
+def test_a_crashing_check_shows_its_traceback(doctor, monkeypatch, capsys):
+    """One line naming the check and the exception type says nothing about
+    which import reached the library that would not load."""
+    def boom():
+        raise OSError("Could not load this library: /x/torchaudio/lib/lib.so")
+
+    boom.__name__ = "check_nanoowl_runtime"
+    monkeypatch.setattr(doctor, "CHECKS", [boom])
+
+    doctor.run_checks()
+
+    out = capsys.readouterr().out
+    assert "check_nanoowl_runtime failed" in out
+    assert "Traceback" in out
+    assert "in boom" in out
+
+
 def test_run_checks_clears_cascade_state(doctor, monkeypatch):
     """--fix re-runs every check in the same process. Stale state would blame
     a freshly repaired torchvision for the next pass's failures."""

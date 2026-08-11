@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import sysconfig
+import traceback
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -245,6 +246,23 @@ def install_matched_torch(driver: int | None):
 
 # The dynamic loader names the first library it cannot find, then stops.
 MISSING_LIBRARY = re.compile(r"(lib[\w.+-]+\.so[\d.]*): cannot open shared object file")
+
+# torchaudio's own extension loader, which raises OSError rather than
+# ImportError and names the .so by full path.
+STALE_LIBRARY = re.compile(r"Could not load this library: (\S+)")
+
+
+def package_owning(path: str) -> str:
+    """'/usr/local/.../dist-packages/torchaudio/lib/libtorchaudio.so' ->
+    'torchaudio'. The import name is what the reader needs; the .so path
+    identifies a file nobody installed by name."""
+    parts = Path(path).parts
+    for marker in ("site-packages", "dist-packages"):
+        if marker in parts:
+            index = parts.index(marker)
+            if index + 1 < len(parts):
+                return parts[index + 1]
+    return Path(path).stem.removeprefix("lib")
 
 
 def run_fix_torch() -> bool:
@@ -833,6 +851,30 @@ def check_nanoowl_runtime() -> None:
             str(exc).splitlines()[0],
             fix_action=install_transformers,
         )
+        return
+    except Exception as exc:
+        # OSError, not ImportError -- torchaudio's extension loader raises its
+        # own type, so this used to escape to run_checks' catch-all and report
+        # "check_nanoowl_runtime failed", naming no package and offering
+        # nothing. transformers reaches torchaudio on the way to
+        # OwlViTForObjectDetection; nothing here uses audio, but a companion
+        # left over from a torch that has since been replaced fails the import
+        # all the same.
+        stale = STALE_LIBRARY.search(str(exc))
+        if stale:
+            package = package_owning(stale.group(1))
+            bad(
+                f"{package} was built against a different torch",
+                stale.group(1),
+                f"transformers imports {package}; that copy links the torch "
+                f"that used to be installed.\n    "
+                f"Install one matching the torch in use -- into the venv, "
+                f"which shadows it:\n    "
+                f"  python3 scripts/fix_torch.py",
+                fix_action=run_fix_torch,
+            )
+        else:
+            bad("transformers import failed", f"{type(exc).__name__}: {exc}")
         return
     ok("transformers", "OwlViTForObjectDetection importable")
 
@@ -1535,6 +1577,13 @@ def run_checks() -> None:
             check()
         except Exception as exc:  # a broken check must not hide the others
             bad(f"{check.__name__} failed", f"{type(exc).__name__}: {exc}")
+            # ...and the one line above must not hide the cause. A check that
+            # crashes instead of reporting has hit something unanticipated by
+            # definition, so the frames are the only information there is --
+            # "check_nanoowl_runtime failed: OSError" says nothing about which
+            # import reached the library that would not load.
+            for line in traceback.format_exc().strip().splitlines()[-7:]:
+                print(f"    {DIM}{line}{RESET}")
 
 
 def main() -> int:

@@ -318,6 +318,105 @@ def test_strategies_stop_at_the_first_that_works(ft, monkeypatch):
     assert attempted == ["first"]
 
 
+TORCHAUDIO_STALE = (
+    "OSError: Could not load this library: "
+    "/usr/local/lib/python3.10/dist-packages/torchaudio/lib/libtorchaudio.so"
+)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TORCHAUDIO_STALE,
+        "ImportError: /x/torchvision/_C.so: undefined symbol: _ZN3c105Error",
+        "RuntimeError: operator torchvision::nms does not exist",
+        "OSError: libc10.so: cannot open shared object file: x",
+    ],
+)
+def test_stale_companions_are_recognised(ft, error):
+    assert ft.STALE_COMPANION.search(error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # Absent is not broken. transformers asks whether torchaudio is
+        # available and copes when it is not; installing one nothing asked for
+        # just acquires the next mismatch.
+        "ModuleNotFoundError: No module named 'torchaudio'",
+        "ImportError: cannot import name 'pipeline' from 'torchaudio'",
+    ],
+)
+def test_absent_or_unrelated_companions_are_left_alone(ft, error):
+    assert ft.STALE_COMPANION.search(error) is None
+
+
+def test_a_stale_companion_is_replaced_with_one_matching_torch(ft, monkeypatch):
+    """torch 2.11.0 needs torchvision/torchaudio 2.11.*; the trio ships in
+    lockstep and a companion only loads against its own torch minor."""
+    installed: list[tuple] = []
+    torch_probe = ft.Probe(ok=True, version="2.11.0", cuda_build="12.6",
+                           path="/venv/torch/__init__.py", cuda_available=True)
+    probes = iter([
+        ft.Probe(ok=True, version="0.26.0", path="/venv/torchvision/__init__.py"),
+        ft.Probe(error=TORCHAUDIO_STALE),
+        ft.Probe(ok=True, version="2.11.0", path="/venv/torchaudio/__init__.py"),
+    ])
+    monkeypatch.setattr(ft, "probe_module", lambda py, name: next(probes))
+    monkeypatch.setattr(ft, "pip", lambda *a: installed.append(a) or True)
+    monkeypatch.delenv("TORCH_INDEX_URL", raising=False)
+
+    assert ft.repair_companions(torch_probe) is True
+    assert installed == [(
+        "install", "--no-cache-dir", "--no-deps",
+        "--index-url", "https://pypi.jetson-ai-lab.io/jp6/cu126",
+        "torchaudio==2.11.*",
+    )]
+
+
+def test_a_missing_companion_is_not_installed(ft, monkeypatch):
+    monkeypatch.setattr(ft, "probe_module", lambda py, name: ft.Probe(
+        error="ModuleNotFoundError: No module named 'torchaudio'"))
+    monkeypatch.setattr(ft, "pip", lambda *a: pytest.fail("must not install"))
+
+    torch_probe = ft.Probe(ok=True, version="2.11.0", cuda_build="12.6",
+                           path="/venv/torch/__init__.py")
+    assert ft.repair_companions(torch_probe) is False
+
+
+def test_companions_are_not_touched_while_torch_itself_is_broken(ft, monkeypatch):
+    """Until torch imports, every companion fails for torch's reason and
+    nothing can be told apart."""
+    monkeypatch.setattr(ft, "probe_module", lambda py, name: pytest.fail("too early"))
+    assert ft.repair_companions(ft.Probe(error=CONTAINER_ERROR)) is False
+
+
+def test_torch_local_version_does_not_leak_into_the_pin(ft, monkeypatch):
+    """torch reports 2.11.0+cu126 on some builds; '2.11.0+cu126.*' matches
+    nothing and the install fails for a reason that looks like a missing
+    wheel."""
+    installed: list[tuple] = []
+    probes = iter([ft.Probe(error=TORCHAUDIO_STALE),
+                   ft.Probe(ok=True, version="2.11.0", path="/venv/tv/__init__.py")])
+    monkeypatch.setattr(ft, "COMPANIONS", ("torchvision",))
+    monkeypatch.setattr(ft, "probe_module", lambda py, name: next(probes))
+    monkeypatch.setattr(ft, "pip", lambda *a: installed.append(a) or True)
+    monkeypatch.delenv("TORCH_INDEX_URL", raising=False)
+
+    ft.repair_companions(ft.Probe(ok=True, version="2.11.0+cu126",
+                                  cuda_build="12.6", path="/venv/torch/__init__.py"))
+    assert installed[0][-1] == "torchvision==2.11.*"
+
+
+def test_index_follows_torchs_cuda_not_the_drivers(ft, monkeypatch):
+    monkeypatch.delenv("TORCH_INDEX_URL", raising=False)
+    assert ft.wheel_index("12.6").endswith("/jp6/cu126")
+    assert ft.wheel_index("12.8").endswith("/jp6/cu128")
+    assert ft.wheel_index(None).endswith("/jp6/cu126")
+    monkeypatch.setenv("TORCH_INDEX_URL", "https://example.invalid/simple")
+    assert ft.wheel_index("12.6") == "https://example.invalid/simple"
+
+
 def test_a_raising_strategy_does_not_hide_the_diagnosis(ft, monkeypatch, capsys):
     def explode(probe, dry_run):
         raise RuntimeError("network down")

@@ -882,6 +882,33 @@ supply one, re-probe, supply the next, until torch imports or nothing helps.
 Both scripts run it automatically, so `./scripts/setup_jetson.sh` and
 `./scripts/build_engines.sh` each cope with the switch on their own.
 
+### "Could not load this library: .../torchaudio/lib/libtorchaudio.so"
+
+Everything else is green, and NanoOWL alone fails. Nothing here uses audio.
+
+`torchvision` and `torchaudio` ship compiled extensions linked against one
+exact torch build, so replacing torch leaves them loading against a torch that
+is no longer there. `transformers` reaches `torchaudio` on its way to
+`OwlViTForObjectDetection`, and the stale copy — usually in system
+`dist-packages`, which a read-only container image will not let you remove —
+fails the import.
+
+Note the exception type: `OSError`, from torchaudio's own extension loader, not
+`ImportError`. It bypasses every "package not installed" handler.
+
+```bash
+python3 scripts/fix_torch.py
+```
+
+After torch itself imports, this probes each companion and replaces only those
+that are *present and refuse to load*, with a version matching torch's minor
+(the trio ships in lockstep), from the index matching torch's CUDA — installed
+into the venv, where it shadows the copy you cannot delete.
+
+A companion that is simply **absent** is left absent: `transformers` asks
+whether `torchaudio` is available and copes when it is not, so installing one
+nothing asked for only acquires the next mismatch.
+
 ### CLIP installs as "UNKNOWN-0.0.0" and `import clip` still fails
 
 pip reports success and nothing works:

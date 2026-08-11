@@ -91,6 +91,24 @@ LIBRARY_WHEELS: dict[str, str] = {
 # not a missing-library problem and looping is not going to find that out.
 MAX_ROUNDS = 8
 
+# torch's companions ship compiled extensions linked against one exact torch
+# build, so a torch that was replaced leaves them loading against the wrong
+# one. Neither is used by this project directly -- torchvision is reached
+# through NanoOWL, torchaudio only because transformers touches it on the way
+# to OwlViTForObjectDetection -- but a stale one fails the import all the same.
+COMPANIONS = ("torchvision", "torchaudio")
+
+# What "stale" looks like, as opposed to "absent". Absent is fine and must be
+# left alone: transformers checks whether torchaudio is available and copes
+# when it is not. Only a companion that is present and will not load is a
+# problem, and only that shape should trigger a repair.
+STALE_COMPANION = re.compile(
+    r"Could not load this library"                  # torchaudio's own loader
+    r"|undefined symbol"                            # ABI drift between builds
+    r"|operator torchvision::\w+ does not exist"    # torchvision's op registry
+    r"|cannot open shared object file"              # links a lib torch dropped
+)
+
 _PROBE = r"""
 import json
 out = {"ok": False}
@@ -106,6 +124,19 @@ else:
     except BaseException as exc:
         out["cuda_available"] = False
         out["cuda_error"] = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+print("<<<PROBE>>>" + json.dumps(out))
+"""
+
+_COMPANION_PROBE = r"""
+import json, sys
+out = {"ok": False}
+try:
+    module = __import__(sys.argv[1])
+except BaseException as exc:
+    out["error"] = f"{type(exc).__name__}: {exc}"
+else:
+    out.update(ok=True, version=getattr(module, "__version__", "?"),
+               path=getattr(module, "__file__", "") or "")
 print("<<<PROBE>>>" + json.dumps(out))
 """
 
@@ -150,9 +181,17 @@ def probe_torch(python: str) -> Probe:
     uninstalls that change which torch is on disk, and a process that has
     already imported torch will not see any of it.
     """
+    return _run_probe([python, "-c", _PROBE])
+
+
+def probe_module(python: str, name: str) -> Probe:
+    return _run_probe([python, "-c", _COMPANION_PROBE, name])
+
+
+def _run_probe(command: list[str]) -> Probe:
     try:
         result = subprocess.run(
-            [python, "-c", _PROBE], capture_output=True, text=True, timeout=300
+            command, capture_output=True, text=True, timeout=300
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return Probe(error=f"{type(exc).__name__}: {exc}")
@@ -396,6 +435,71 @@ def resolve(dry_run: bool = False) -> Probe:
     return probe
 
 
+def wheel_index(cuda_build: str | None) -> str:
+    """The index that published the torch we ended up with.
+
+    Derived from torch's own CUDA version rather than the driver's, so a
+    companion is matched to torch, which is what its compiled extension
+    actually links against.
+    """
+    tag = f"cu{cuda_build.replace('.', '')}" if cuda_build else "cu126"
+    return os.environ.get(
+        "TORCH_INDEX_URL", f"https://pypi.jetson-ai-lab.io/jp6/{tag}")
+
+
+def repair_companions(torch_probe: Probe, dry_run: bool = False) -> bool:
+    """Replace companions left over from a torch that is no longer here.
+
+    Runs only once torch itself imports, because until then every companion
+    fails for torch's reason and nothing can be told apart.
+
+    Absent is not broken. transformers asks whether torchaudio is available
+    and copes when it is not, so a missing companion is left missing --
+    installing one nothing asked for is how you acquire the next mismatch.
+    Only a companion that is present and refuses to load gets touched.
+    """
+    if not torch_probe.ok:
+        return False
+
+    # torch 2.11.0 -> torchvision/torchaudio 2.11.*: the trio is released in
+    # lockstep and a companion only loads against its own torch minor.
+    series = ".".join(torch_probe.version.split("+")[0].split(".")[:2])
+    repaired = False
+
+    for name in COMPANIONS:
+        probe = probe_module(sys.executable, name)
+        if probe.ok:
+            continue
+        if not STALE_COMPANION.search(probe.error):
+            continue  # absent, or broken for a reason installing cannot fix
+
+        print(f"\n{BOLD}--> {name} was built against a torch that is no longer "
+              f"installed{RESET}")
+        bad(f"{name} does not load", probe.error)
+        index = wheel_index(torch_probe.cuda_build)
+        if dry_run:
+            warn(f"--dry-run: would install {name}~={series} from {index}")
+            continue
+
+        # Into the venv, where it shadows the stale copy -- which usually sits
+        # in system dist-packages that we neither own nor, inside a read-only
+        # container image, can write to.
+        if not pip("install", "--no-cache-dir", "--no-deps",
+                   "--index-url", index, f"{name}=={series}.*"):
+            bad(f"could not install a matching {name}",
+                f"remove the stale copy instead: it is at {probe.raw.get('path') or 'the path above'}")
+            continue
+
+        after = probe_module(sys.executable, name)
+        if after.ok:
+            ok(f"{name} loads", f"{after.version}  {after.path}")
+            repaired = True
+        else:
+            bad(f"{name} still does not load", after.error)
+
+    return repaired
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
@@ -405,6 +509,7 @@ def main() -> int:
     print(f"{BOLD}torch{RESET}")
     probe = resolve(dry_run=args.dry_run)
     if probe.ok:
+        repair_companions(probe, dry_run=args.dry_run)
         return 0
 
     print()
