@@ -58,6 +58,72 @@ sys.exit(0 if status == "ok" else 1)
 PYEOF
 }
 
+# Every pip install below can decide it wants a different torch. --no-deps
+# blocks that wherever we control the command, but a *transitive* dependency
+# can still declare an unconstrained torch and pull a PyPI CUDA wheel over
+# JetPack's build -- silently, mid-script, announced as nothing worse than
+# "Successfully installed". It surfaces much later, and somewhere else: as
+# "torchvision not importable", or as torch.cuda.is_available() going False,
+# by which point the install that caused it has scrolled away.
+#
+# So fingerprint torch and re-check after each section. This does not prevent
+# the damage; it names the section that did it, while the command is still on
+# screen.
+torch_fingerprint() {
+  "$PYTHON" - <<'PYEOF' 2>/dev/null || echo "absent"
+import torch
+print(f"{torch.__version__} {torch.__file__}")
+PYEOF
+}
+
+TORCH_BEFORE="$(torch_fingerprint)"
+
+assert_torch_unchanged() {
+  local now
+  now="$(torch_fingerprint)"
+  if [[ "$now" != "$TORCH_BEFORE" ]]; then
+    warn "torch CHANGED while installing: $1"
+    warn "  before:  $TORCH_BEFORE"
+    warn "  after:   $now"
+    if [[ "$now" == "absent" ]]; then
+      warn "That install removed torch outright."
+    else
+      warn "A dependency replaced JetPack's torch, most likely with a PyPI wheel"
+      warn "built against a CUDA this driver cannot run."
+    fi
+    warn "Every CUDA stage fails until this is undone:  $PYTHON scripts/doctor.py --fix"
+    # Re-baseline so one replacement is reported once, not by every later check.
+    TORCH_BEFORE="$now"
+  fi
+}
+
+# JetPack's Ubuntu 22.04 ships packaging 21.3 in /usr/lib/python3/dist-packages,
+# and setuptools (>=71) prefers an installed `packaging` over its own vendored
+# copy. Building any sdist that has a MANIFEST.in then dies inside setuptools'
+# own metadata path with:
+#     TypeError: canonicalize_version() got an unexpected keyword argument
+#     'strip_trailing_zero'
+# -- a keyword that arrived in packaging 22.0. Nothing about the package being
+# built is wrong, which is what makes it so confusing to read: CLIP fails this
+# way every time (it has a MANIFEST.in) while segment-anything installs fine
+# (it has none, so setuptools never reaches prune_file_list). The editable
+# installs below go through the same metadata path.
+#
+# Installed into the venv, which precedes /usr/lib/python3/dist-packages on
+# sys.path, so this shadows the old copy without sudo or touching JetPack.
+# Pure Python, no torch, nothing here to break.
+log "packaging (JetPack's 21.3 breaks sdist builds under modern setuptools)"
+if "$PYTHON" - <<'PYEOF' 2>/dev/null
+import inspect
+from packaging.utils import canonicalize_version
+assert "strip_trailing_zero" in inspect.signature(canonicalize_version).parameters
+PYEOF
+then
+  ok "already new enough"
+else
+  "$PYTHON" -m pip install "packaging>=24.2"
+fi
+
 MODULES_TSV="$("$PYTHON" - <<PYEOF
 import sys
 sys.path.insert(0, "$REPO_ROOT")
@@ -100,6 +166,8 @@ while IFS=$'\t' read -r name url editable build_iso; do
     NEEDS_REPO_PATHS+=("$dest")
   fi
 done <<<"$MODULES_TSV"
+
+assert_torch_unchanged "the four model repos"
 
 if (( ${#NEEDS_REPO_PATHS[@]} )); then
   cat <<EOF
@@ -234,6 +302,8 @@ else
   "$PYTHON" -m pip install triton
 fi
 
+assert_torch_unchanged "the NanoOWL / EfficientViT-SAM runtime dependencies"
+
 # ── YOLO-World-S ─────────────────────────────────────────────────────────
 # The second detector. Set SKIP_YOLOWORLD=1 to leave it out -- nothing in
 # the default NanoOWL pairings needs any of the three installs below.
@@ -258,11 +328,24 @@ else
   # ultralytics' own dependencies, minus torch/torchvision/opencv-python.
   # numpy is already pinned <2 above and pillow/pyyaml/requests usually come
   # in with transformers, but naming them all keeps this independent of
-  # what happened to be installed first.
+  # what happened to be installed first. None of these eight declares torch.
   log "ultralytics' safe dependencies (no torch, no opencv-python)"
   "$PYTHON" -m pip install \
-    filelock matplotlib pillow pyyaml requests psutil polars \
-    nvidia-ml-py ultralytics-thop
+    filelock matplotlib pillow pyyaml requests psutil polars nvidia-ml-py
+
+  # ultralytics-thop is the exception, and it gets its own line because of it:
+  # it declares an unconstrained `torch`. Listed alongside the eight above it
+  # re-opens the exact hole --no-deps was added to close -- pip is entitled to
+  # satisfy that requirement from PyPI, and on a Jetson the newest PyPI torch
+  # is a CUDA-13 wheel that the driver cannot run and that leaves torchvision
+  # behind. thop's *only* dependency is torch, and torch is already installed,
+  # so --no-deps skips nothing real here.
+  #
+  # ultralytics imports thop lazily and behind a try/except (nn/tasks.py, for
+  # FLOPs profiling), so this is not load-bearing for detection either way.
+  log "ultralytics-thop (--no-deps: it declares an unconstrained torch)"
+  "$PYTHON" -m pip install ultralytics-thop --no-deps
+  assert_torch_unchanged "ultralytics and its dependencies"
 
   # CLIP encodes the text prompts inside YOLOWorld.set_classes(). This is
   # NOT optional and it must be installed HERE, ahead of time: ultralytics
@@ -277,7 +360,14 @@ else
   else
     "$PYTHON" -m pip install "git+https://github.com/ultralytics/CLIP.git" --no-deps
     "$PYTHON" -m pip install ftfy regex tqdm
+    if "$PYTHON" -c 'import clip' >/dev/null 2>&1; then
+      ok "installed"
+    else
+      warn "CLIP did not install -- the YOLO-World pairings will be unavailable"
+      warn "Everything else still works; the NanoOWL pairings do not touch CLIP."
+    fi
   fi
+  assert_torch_unchanged "CLIP"
 fi
 
 log "Verifying"

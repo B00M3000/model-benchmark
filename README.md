@@ -735,8 +735,8 @@ reason.
 
 ```bash
 pip install ultralytics --no-deps
-pip install filelock matplotlib pillow pyyaml requests psutil polars \
-            nvidia-ml-py ultralytics-thop
+pip install filelock matplotlib pillow pyyaml requests psutil polars nvidia-ml-py
+pip install ultralytics-thop --no-deps        # see below: this one declares torch
 pip install git+https://github.com/ultralytics/CLIP.git --no-deps
 pip install ftfy regex tqdm
 ```
@@ -745,8 +745,16 @@ pip install ftfy regex tqdm
 ultralytics declares `torch`, `torchvision` **and** `opencv-python` as hard
 dependencies: the first two would replace JetPack's builds — the failure the
 rest of this document is about — and the third would shadow JetPack's `cv2`,
-which is the one compiled with CUDA and GStreamer. Its remaining
-dependencies are safe, which is why they are installed by name above.
+which is the one compiled with CUDA and GStreamer.
+
+Seven of its remaining dependencies are safe and are installed by name above.
+`ultralytics-thop` is the exception and gets its own line: it declares an
+unconstrained `torch` of its own, so listing it alongside the other seven
+re-opens the exact hole `--no-deps` was added to close — pip may satisfy that
+requirement from PyPI, and the newest PyPI torch is a CUDA-13 wheel a JetPack 6
+driver cannot run. Its *only* dependency is torch, which is already installed,
+so `--no-deps` skips nothing real. (ultralytics imports thop lazily behind a
+`try/except`, for FLOPs profiling — detection does not need it either way.)
 
 CLIP matters for a subtler reason. YOLO-World encodes its prompts through
 CLIP inside `set_classes()`, and if the import fails **ultralytics shells out
@@ -814,6 +822,50 @@ of the wheel (`sudo apt install python3-opencv`, plus `--system-site-packages`
 on the venv), or pin `opencv-python-headless==4.10.0.84`, the last release that
 resolves against NumPy 1.x.
 
+### doctor reports five problems and four of them are the same one
+
+A report like this is one failure, not five:
+
+```
+✗ torch.cuda.is_available() is False
+✗ segment_anything not importable
+✗ timm not importable
+✗ efficientvit.models.efficientvit.sam import failed   ModuleNotFoundError: No module named 'torchvision'
+! ultralytics not importable                           PackageNotFoundError: No package metadata was found for torchvision
+```
+
+`segment_anything`, `timm`, `efficientvit` and `ultralytics` are all installed
+and all fine. Each one imports torchvision — `segment_anything` from
+`automatic_mask_generator.py`, `timm` from its data loaders, `ultralytics` by
+resolving its declared dependencies at import — so when torchvision is missing,
+each fails *under its own name*. Reinstalling any of them fixes nothing.
+
+The cause is one bad torch: a PyPI wheel landed on top of JetPack's build and
+took torchvision with it. Confirm with the version string —
+
+```bash
+.venv/bin/python -c "import torch; print(torch.__version__, torch.__file__)"
+```
+
+`2.13.0+cu130` on a driver that supports CUDA 12.6 is a PyPI wheel. JetPack
+builds carry an `.nv` suffix. Repair the pair and every one of those reports
+clears at once:
+
+```bash
+python3 scripts/doctor.py --fix        # installs a driver-matched torch + torchvision into the venv
+```
+
+doctor now labels these `(torchvision fallout)` in its summary and withholds
+the misleading per-package install hints, so the list says which one to chase.
+
+**How torch gets replaced in the first place:** some transitive dependency
+declares an unconstrained `torch` and pip is free to satisfy it from PyPI —
+`ultralytics-thop` is one, which is why `setup_jetson.sh` installs it with
+`--no-deps` on a line of its own. The script also fingerprints torch before and
+after each install section and shouts if it changed, so the next occurrence is
+named while the responsible command is still on screen rather than surfacing
+five sections later as this.
+
 ### "operator torchvision::nms does not exist"
 
 torchvision's compiled extension was built against a different torch than the
@@ -868,21 +920,37 @@ pip install --no-cache-dir --index-url https://pypi.jetson-ai-lab.io/jp6/cu126 t
 at import. Then reinstall the model repos with `--no-deps` so pip cannot replace
 torch again.
 
-### If `pip install -e` fails
+### "TypeError: canonicalize_version() got an unexpected keyword argument 'strip_trailing_zero'"
 
-JetPack images frequently ship a setuptools newer than their `packaging`, and
-editable installs then die with:
+An install — editable, or straight from git — dies inside setuptools itself,
+with a traceback that never mentions the package being installed:
 
 ```
+File ".../setuptools/_core_metadata.py", line 293, in _distribution_fullname
+  canonicalize_version(version, strip_trailing_zero=False),
 TypeError: canonicalize_version() got an unexpected keyword argument 'strip_trailing_zero'
 ```
 
-`strip_trailing_zero` landed in packaging 23.2, so the fix is to align the pair
-inside the venv (which shadows the system copies without touching JetPack):
+Nothing is wrong with the package. JetPack's Ubuntu 22.04 ships **packaging
+21.3** in `/usr/lib/python3/dist-packages`, and setuptools (≥71) prefers an
+installed `packaging` over its own vendored copy — so it calls a keyword that
+only exists from **packaging 22.0** onward.
+
+The confusing part is that it only bites *some* installs. setuptools reaches
+that call from `prune_file_list()`, which runs only when the project has a
+`MANIFEST.in`. `git+https://github.com/ultralytics/CLIP.git` has one and fails
+every time; `git+.../segment-anything.git` has none and installs cleanly right
+next to it, in the same run.
+
+Fix it by shadowing the system copy inside the venv (no sudo, nothing JetPack
+owns is touched):
 
 ```bash
-.venv/bin/pip install -U pip setuptools wheel "packaging>=23.2"
+.venv/bin/pip install "packaging>=24.2"
 ```
+
+`setup_jetson.sh` now does this before any install, checking the actual
+signature rather than a version string.
 
 If it persists, pin setuptools back below the change instead:
 

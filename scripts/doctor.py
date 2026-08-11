@@ -35,6 +35,10 @@ _warnings: list[str] = []
 # (label, callable) for everything --fix knows how to repair. Populated as the
 # checks run, so a fix is only ever offered for a problem actually observed.
 _fixes: list[tuple[str, Callable[[], bool]]] = []
+# Set by check_torchvision when torchvision is missing or unusable. Read by
+# torchvision_cascade() so the checks further down can tell "this package is
+# missing" apart from "this package is fine, torchvision underneath it isn't".
+_torchvision_failed = False
 
 
 def ok(label: str, detail: str = "") -> None:
@@ -290,18 +294,25 @@ def check_torch() -> None:
             hint,
             fix_action=install_matched_torch(driver) if "too old" in message else None,
         )
-        return
+    else:
+        if available:
+            ok("torch.cuda", f"{torch.cuda.get_device_name(0)}")
+        else:
+            bad(
+                "torch.cuda.is_available() is False",
+                fix="No usable GPU. On a Jetson this usually means a mismatched "
+                    "torch wheel.\n    " + JETSON_TORCH_FIX,
+                fix_action=install_matched_torch(driver),
+            )
 
-    if not available:
-        bad(
-            "torch.cuda.is_available() is False",
-            fix="No usable GPU. On a Jetson this usually means a mismatched torch "
-                "wheel.\n    " + JETSON_TORCH_FIX,
-            fix_action=install_matched_torch(driver),
-        )
-        return
-
-    ok("torch.cuda", f"{torch.cuda.get_device_name(0)}")
+    # Reached whether or not CUDA came up -- deliberately, and this used to be
+    # a bare `return` above instead. torchvision is a separate axis from CUDA:
+    # a driver-mismatched torch wheel takes torchvision with it, but the
+    # is_available() failure is the only symptom that gets reported, so the
+    # missing torchvision goes unmentioned here and instead resurfaces four
+    # sections later as segment_anything, timm, efficientvit and ultralytics
+    # each "not importable" -- one root cause wearing four disguises. Check it
+    # here, where it can still be named.
     check_torchvision(torch, driver)
 
 
@@ -345,6 +356,47 @@ MATCHED_PAIR_FIX = (
 )
 
 
+TORCHVISION_CASCADE = (
+    "Installed and fine -- it failed because torchvision underneath it is "
+    "broken (reported under PyTorch / CUDA above). Reinstalling this package "
+    "will not help; repair torchvision and re-run."
+)
+
+# Labels reported only as fallout from a broken torchvision, so the summary can
+# say so instead of presenting five equal-looking problems.
+_cascaded: list[str] = []
+
+
+def report_cascade(label: str, severity=None) -> None:
+    """Report `label` as fallout from the torchvision failure, not as its own
+    problem. No fix_action, deliberately: every fix on offer here would
+    reinstall something that is already installed correctly."""
+    (severity or bad)(label, TORCHVISION_CASCADE)
+    _cascaded.append(label)
+
+
+def torchvision_cascade(exc: BaseException) -> bool:
+    """True when `exc` is really the torchvision failure already reported.
+
+    A broken torchvision does not announce itself. It surfaces as four
+    separate-looking failures, each named after some other package:
+    segment_anything imports torchvision.ops.boxes from its
+    automatic_mask_generator, timm imports it from its data loaders,
+    ultralytics declares it and looks up its metadata at import. Reported at
+    face value, one root cause becomes four "not importable" lines, each
+    suggesting a reinstall of a package that is already present and correct
+    -- so following the advice fixes nothing and the real cause stays
+    invisible. Attribute them instead.
+    """
+    if not _torchvision_failed:
+        return False
+    # ModuleNotFoundError and importlib.metadata.PackageNotFoundError (a
+    # subclass of it) both carry the offending name; plain ImportError does
+    # not, hence the message fallback.
+    name = (getattr(exc, "name", "") or "").split(".")[0]
+    return name == "torchvision" or "torchvision" in str(exc)
+
+
 def check_torchvision(torch, driver: int | None = None) -> None:
     """NanoOWL imports torchvision.ops.roi_align, so this must actually work.
 
@@ -353,19 +405,23 @@ def check_torchvision(torch, driver: int | None = None) -> None:
     not exist" -- so importability alone proves nothing, and the ops get
     exercised below.
     """
+    global _torchvision_failed
     torch_root = Path(torch.__file__).resolve().parent.parent
 
     try:
         import torchvision
     except ImportError:
+        _torchvision_failed = True
         bad(
             "torchvision not importable",
-            "NanoOWL needs torchvision.ops.roi_align",
+            "NanoOWL needs torchvision.ops.roi_align; segment_anything, timm "
+            "and ultralytics all import it too",
             MATCHED_PAIR_FIX,
             fix_action=install_matched_torch(driver),
         )
         return
     except RuntimeError as exc:
+        _torchvision_failed = True
         bad(
             "torchvision failed to load",
             str(exc).splitlines()[0],
@@ -397,6 +453,7 @@ def check_torchvision(torch, driver: int | None = None) -> None:
         )
         ok("torchvision ops", "nms / roi_align registered")
     except Exception as exc:
+        _torchvision_failed = True
         bad(
             "torchvision ops are not registered",
             f"{type(exc).__name__}: {str(exc).splitlines()[0]}",
@@ -627,6 +684,9 @@ def check_nanosam_runtime() -> None:
     try:
         from nanosam.mobile_sam import sam_model_registry  # noqa: F401
     except ModuleNotFoundError as exc:
+        if torchvision_cascade(exc):
+            report_cascade("nanosam.mobile_sam not importable", warn)
+            return
         warn(
             f"{exc.name} not importable",
             "only needed if exporting the mask decoder fresh "
@@ -788,12 +848,15 @@ def check_efficientvit_runtime() -> None:
         try:
             importlib.import_module(dep.module)
         except ImportError as exc:
-            bad(
-                f"{dep.module} not importable",
-                dep.why,
-                dep.install_hint,
-                fix_action=install_runtime_dep(dep),
-            )
+            if torchvision_cascade(exc):
+                report_cascade(f"{dep.module} not importable")
+            else:
+                bad(
+                    f"{dep.module} not importable",
+                    dep.why,
+                    dep.install_hint,
+                    fix_action=install_runtime_dep(dep),
+                )
         else:
             ok(dep.module)
 
@@ -804,11 +867,14 @@ def check_efficientvit_runtime() -> None:
     try:
         from efficientvit.models.efficientvit.sam import EfficientViTSamPredictor  # noqa: F401
     except Exception as exc:
-        bad(
-            "efficientvit.models.efficientvit.sam import failed",
-            f"{type(exc).__name__}: {str(exc).splitlines()[0]} -- unexpected; "
-            "not one of the dependencies above",
-        )
+        if torchvision_cascade(exc):
+            report_cascade("efficientvit.models.efficientvit.sam import failed")
+        else:
+            bad(
+                "efficientvit.models.efficientvit.sam import failed",
+                f"{type(exc).__name__}: {str(exc).splitlines()[0]} -- unexpected; "
+                "not one of the dependencies above",
+            )
     else:
         ok("efficientvit.models.efficientvit.sam", "EfficientViTSamPredictor importable")
 
@@ -820,11 +886,17 @@ def check_efficientvit_runtime() -> None:
     try:
         from efficientvit.sam_model_zoo import create_efficientvit_sam_model  # noqa: F401
     except Exception as exc:
-        bad(
-            "efficientvit.sam_model_zoo.create_efficientvit_sam_model missing",
-            f"{type(exc).__name__}: {str(exc).splitlines()[0]} -- the installed "
-            "efficientvit exposes a different model-factory name than this app calls",
-        )
+        if torchvision_cascade(exc):
+            # Without this branch the message below accuses upstream of a
+            # rename it did not make: the import never got far enough to look
+            # for the symbol at all.
+            report_cascade("efficientvit.sam_model_zoo import failed")
+        else:
+            bad(
+                "efficientvit.sam_model_zoo.create_efficientvit_sam_model missing",
+                f"{type(exc).__name__}: {str(exc).splitlines()[0]} -- the installed "
+                "efficientvit exposes a different model-factory name than this app calls",
+            )
     else:
         ok("efficientvit.sam_model_zoo", "create_efficientvit_sam_model importable")
 
@@ -841,12 +913,33 @@ def install_yoloworld() -> bool:
     ok_deps = run_fix(
         "install ultralytics' safe dependencies (no torch, no opencv-python)",
         [sys.executable, "-m", "pip", "install", "filelock", "matplotlib", "pillow",
-         "pyyaml", "requests", "psutil", "polars", "nvidia-ml-py", "ultralytics-thop"],
+         "pyyaml", "requests", "psutil", "polars", "nvidia-ml-py"],
     )
-    return ok_pkg and ok_deps
+    # Separate, and --no-deps, because ultralytics-thop declares an
+    # unconstrained torch. Bundled into the line above it hands pip licence to
+    # fetch a PyPI CUDA wheel over JetPack's build -- a repair that breaks the
+    # host worse than the warning it was fixing. torch is already installed, so
+    # --no-deps skips nothing here.
+    ok_thop = run_fix(
+        "install ultralytics-thop (--no-deps: it declares an unconstrained torch)",
+        [sys.executable, "-m", "pip", "install", "ultralytics-thop", "--no-deps"],
+    )
+    return ok_pkg and ok_deps and ok_thop
 
 
 def install_clip() -> bool:
+    # CLIP is the one install here built from an sdist, and it carries a
+    # MANIFEST.in -- which is what sends setuptools through prune_file_list()
+    # into canonicalize_version(strip_trailing_zero=...), a keyword that only
+    # exists from packaging 22.0. JetPack's Ubuntu 22.04 ships packaging 21.3
+    # and setuptools >=71 prefers the installed copy over its vendored one, so
+    # this install fails on a stock image every time, with a traceback that
+    # never mentions CLIP. Shadow the old copy in the venv first.
+    run_fix(
+        "ensure packaging is new enough to build an sdist "
+        "(JetPack ships 21.3; setuptools needs >=22.0)",
+        [sys.executable, "-m", "pip", "install", "packaging>=24.2"],
+    )
     ok_pkg = run_fix(
         "install CLIP (encodes YOLO-World's prompts)",
         [sys.executable, "-m", "pip", "install",
@@ -870,6 +963,13 @@ def check_yoloworld_runtime() -> None:
     try:
         from ultralytics import YOLOWorld  # noqa: F401
     except ImportError as exc:
+        if torchvision_cascade(exc):
+            # ultralytics resolves its declared dependencies at import time, so
+            # a torchvision with no metadata raises PackageNotFoundError from
+            # inside `import ultralytics` -- which reads as "ultralytics is not
+            # installed" when it is installed and undamaged.
+            report_cascade("ultralytics not importable", warn)
+            return
         warn(
             "ultralytics not importable",
             f"{type(exc).__name__}: {str(exc).splitlines()[0]} -- only needed for "
@@ -1205,6 +1305,13 @@ CHECKS = (
 
 
 def run_checks() -> None:
+    # Reset alongside _problems/_warnings so the --fix re-check starts clean:
+    # left set from the first pass, a repaired torchvision would still be
+    # blamed for every later failure.
+    global _torchvision_failed
+    _torchvision_failed = False
+    _cascaded.clear()
+
     for check in CHECKS:
         try:
             check()
@@ -1255,7 +1362,17 @@ def main() -> int:
     if _problems:
         print(f"{RED}{len(_problems)} problem(s) block a real benchmark:{RESET}")
         for problem in _problems:
-            print(f"  · {problem}")
+            marker = "  ·"
+            print(f"{marker} {problem}"
+                  + (f"  {DIM}(torchvision fallout){RESET}" if problem in _cascaded else ""))
+        # Counted against _problems, not against _cascaded: the optional
+        # runtimes report their fallout as warnings, and those are not in the
+        # list this line is describing.
+        cascaded_here = [p for p in _problems if p in _cascaded]
+        if cascaded_here:
+            print(f"\n{DIM}{len(cascaded_here)} of these are one root cause: "
+                  f"torchvision. Repair it first -- the rest should clear on "
+                  f"their own.{RESET}")
         if _fixes and not args.fix:
             print(f"\n{DIM}{len(_fixes)} of these can be attempted automatically: "
                   f"python3 scripts/doctor.py --fix{RESET}")
