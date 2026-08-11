@@ -898,6 +898,38 @@ Importing torchvision is not sufficient proof that it works — the failure abov
 happens at import, but a subtler mismatch can import cleanly and only fail when
 an op is called. `scripts/doctor.py` actually invokes `nms` to confirm.
 
+**If you just ran that command and nothing changed, the venv is losing.** pip
+reports `Successfully installed torch-2.11.0`, and `import torch` goes on
+resolving to `/usr/local/lib/python3.10/dist-packages`. A venv is not
+guaranteed to win: with `--system-site-packages` the system `dist-packages`
+directories are on `sys.path` too, and `PYTHONPATH` — which Jetson setup guides
+hand out freely — precedes *every* site directory regardless of what is
+installed where. This is worse than a no-op, because the half of the pair that
+is **not** shadowed does take effect: a venv torchvision loaded against a system
+torch is exactly the `nms` error above.
+
+Check which copy actually wins:
+
+```bash
+.venv/bin/python -c "
+import os, sys, sysconfig
+print('PYTHONPATH =', os.environ.get('PYTHONPATH'))
+print('venv purelib =', sysconfig.get_paths()['purelib'])
+for i, p in enumerate(sys.path): print(f'  {i}: {p}')
+"
+```
+
+If `PYTHONPATH` names the shadowing directory, `unset PYTHONPATH` (and drop it
+from `~/.bashrc`). Otherwise the shadowing copy has to be removed outright —
+it is a PyPI wheel, not JetPack's, and the venv already has the replacement:
+
+```bash
+sudo python3 -m pip uninstall -y torch torchvision
+```
+
+`doctor.py` reports this as *"the venv's torch is installed but not the one
+being imported"*, names which mechanism it is, and offers the matching repair.
+
 ### "The NVIDIA driver on your system is too old (found version 12060)"
 
 The torch being imported was built against a newer CUDA than the Jetson driver

@@ -17,9 +17,12 @@ import argparse
 import ctypes
 import importlib
 import os
+import re
 import subprocess
 import sys
+import sysconfig
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -191,13 +194,24 @@ JETSON_TORCH_FIX = (
 )
 
 
+@lru_cache(maxsize=None)
 def install_matched_torch(driver: int | None):
     """Install a driver-matched torch/torchvision into the *venv*.
 
-    Deliberately into the venv rather than over the system copy: the venv takes
-    precedence over /usr/local/lib/.../dist-packages, so this shadows the bad
-    build without sudo and without touching anything JetPack owns. Undo by
-    deleting the venv.
+    Deliberately into the venv rather than over the system copy: no sudo, and
+    nothing JetPack owns is touched. Undo by deleting the venv.
+
+    This is necessary but on some hosts not sufficient -- see
+    check_shadowed_package(). Whether the venv actually wins over
+    /usr/local/lib/.../dist-packages depends on sys.path order and on
+    PYTHONPATH, and it is not safe to assume it does; that assumption used to
+    live in this docstring and was wrong on a real Jetson, where --fix
+    installed the correct wheels and the report did not move.
+
+    Cached, and not merely as an optimization: both the torch.cuda failure and
+    the torchvision failure hand this same repair to --fix, and --fix dedupes
+    the queue by callable identity. A fresh closure per call defeated that and
+    downloaded 232 MB twice, the second install undoing and redoing the first.
 
     torch and torchvision go in together, always -- installing one alone is
     what produces "operator torchvision::nms does not exist". That failure
@@ -227,6 +241,114 @@ def install_matched_torch(driver: int | None):
     return run
 
 
+def installed_version(package_dir: Path) -> str:
+    """Version of a package sitting on disk, without importing it.
+
+    Importing is exactly what we cannot do here -- the whole point is that
+    some *other* copy of this package is the one that imports.
+    """
+    version_py = package_dir / "version.py"
+    if version_py.exists():
+        match = re.search(
+            r"""^__version__\s*=\s*['"]([^'"]+)""",
+            version_py.read_text(errors="ignore"),
+            re.MULTILINE,
+        )
+        if match:
+            return match.group(1)
+    for info in package_dir.parent.glob(f"{package_dir.name}-*.dist-info"):
+        # "torch-2.11.0.dist-info" -> "2.11.0". The suffix has to come off
+        # before splitting: ".dist-info" contains the separator too, so a
+        # plain split("-")[1] yields "2.11.0.dist".
+        return info.name.removesuffix(".dist-info").split("-", 1)[1]
+    return "?"
+
+
+def base_python() -> str:
+    """The interpreter the venv was built from -- i.e. the one whose pip owns
+    /usr/local/lib/pythonX.Y/dist-packages."""
+    return getattr(sys, "_base_executable", None) or str(
+        Path(sys.base_prefix) / "bin" / "python3"
+    )
+
+
+def uninstall_shadowing(names: tuple[str, ...]):
+    def run() -> bool:
+        return run_fix(
+            f"remove the system-wide {', '.join(names)} shadowing the venv",
+            [base_python(), "-m", "pip", "uninstall", "-y", *names],
+            use_sudo=True,
+        )
+
+    return run
+
+
+def check_shadowed_package(module, label: str) -> bool:
+    """Report a venv copy of `label` that is installed but never imported.
+
+    The failure this exists for: --fix installs a driver-matched torch into the
+    venv, pip says "Successfully installed torch-2.11.0", and `import torch`
+    goes on resolving to /usr/local/lib/python3.10/dist-packages. Every
+    subsequent report is identical to before the repair, so --fix looks like it
+    silently did nothing -- and the half of the pair that *isn't* shadowed
+    (torchvision, which now exists only in the venv) gets loaded against the
+    wrong torch, turning a clean "not importable" into "operator
+    torchvision::nms does not exist".
+
+    A venv is not guaranteed to win. With --system-site-packages the system
+    dist-packages directories are on sys.path too, and PYTHONPATH -- which
+    JetPack setup guides hand out freely -- lands ahead of every site directory
+    regardless. Measured here rather than assumed.
+
+    Returns True when shadowing was found.
+    """
+    if sys.prefix == sys.base_prefix:
+        return False
+
+    venv_copy = Path(sysconfig.get_paths()["purelib"]) / label
+    if not venv_copy.is_dir():
+        return False  # nothing in the venv to be shadowed
+
+    imported = Path(module.__file__).resolve().parent
+    if imported == venv_copy.resolve():
+        return False
+
+    shadowing_dir = str(imported.parent)
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    via_pythonpath = any(
+        part and Path(part).resolve() == imported.parent
+        for part in pythonpath.split(os.pathsep)
+    )
+
+    if via_pythonpath:
+        cause = (
+            f"PYTHONPATH puts {shadowing_dir} ahead of the venv. PYTHONPATH "
+            f"precedes every site-packages directory, so no amount of "
+            f"installing into the venv can win.\n    "
+            f"Unset it for this shell and re-run:  unset PYTHONPATH\n    "
+            f"(and remove it from ~/.bashrc if it is set there)"
+        )
+        action = None
+    else:
+        cause = (
+            f"{shadowing_dir} precedes the venv on sys.path. Installing into "
+            f"the venv cannot fix this; the shadowing copy has to go:\n    "
+            f"  sudo {base_python()} -m pip uninstall -y {label}\n    "
+            f"That copy is a PyPI wheel, not JetPack's -- removing it loses "
+            f"nothing the venv does not already have."
+        )
+        action = uninstall_shadowing((label,))
+
+    bad(
+        f"the venv's {label} is installed but not the one being imported",
+        f"imported {installed_version(imported)} from {imported}; "
+        f"venv has {installed_version(venv_copy)} at {venv_copy}",
+        cause,
+        fix_action=action,
+    )
+    return True
+
+
 def check_torch() -> None:
     section("PyTorch / CUDA")
 
@@ -250,6 +372,12 @@ def check_torch() -> None:
     built_for = torch.version.cuda
 
     ok("torch", f"{version}  (built for CUDA {built_for})  {torch.__file__}")
+
+    # Before anything that reads torch's version or CUDA build: if this is not
+    # the copy the venv installed, every number below describes a package the
+    # last repair already tried to replace, and the repair on offer is the one
+    # that just failed to take.
+    check_shadowed_package(torch, "torch")
 
     # Checked before the CUDA early-returns below: a broken numpy bridge
     # breaks NanoOWL regardless of whether CUDA works.
@@ -432,6 +560,7 @@ def check_torchvision(torch, driver: int | None = None) -> None:
         return
 
     ok("torchvision", f"{torchvision.__version__}  {torchvision.__file__}")
+    check_shadowed_package(torchvision, "torchvision")
 
     # A venv torchvision alongside a system torch is the usual cause.
     tv_root = Path(torchvision.__file__).resolve().parent.parent
@@ -1353,10 +1482,12 @@ def main() -> int:
 
         print(f"\n{BOLD}{'='*60}{RESET}")
         print(f"{BOLD}Re-checking after {applied}/{len(unique_fixes)} repair(s){RESET}")
-        _problems.clear()
-        _warnings.clear()
-        _fixes.clear()
-        run_checks()
+        # In a fresh interpreter, not in this one. Several repairs replace
+        # modules this process imported minutes ago -- torch above all -- and
+        # Python will not reload them. An in-process re-check therefore reports
+        # the state from *before* the repair, indistinguishable from a repair
+        # that did nothing, which is precisely the case it needs to tell apart.
+        return subprocess.run([sys.executable, str(Path(__file__).resolve())]).returncode
 
     print()
     if _problems:

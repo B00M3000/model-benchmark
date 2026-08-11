@@ -128,6 +128,97 @@ def test_run_checks_clears_cascade_state(doctor, monkeypatch):
     assert doctor._cascaded == []
 
 
+def make_package(site_packages: Path, name: str, version: str) -> Path:
+    """A package on disk, complete enough for installed_version() to read."""
+    pkg = site_packages / name
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "version.py").write_text(f"__version__ = '{version}'\n")
+    return pkg
+
+
+@pytest.fixture
+def venv(doctor, tmp_path, monkeypatch):
+    """Pose as a venv whose site-packages is tmp_path/venv-sp."""
+    site_packages = tmp_path / "venv-sp"
+    site_packages.mkdir()
+    monkeypatch.setattr(doctor.sys, "prefix", str(tmp_path / "venv"))
+    monkeypatch.setattr(doctor.sys, "base_prefix", str(tmp_path / "base"))
+    monkeypatch.setattr(
+        doctor.sysconfig, "get_paths", lambda: {"purelib": str(site_packages)})
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    return site_packages
+
+
+def fake_module(package_dir: Path):
+    module = type(sys)(package_dir.name)
+    module.__file__ = str(package_dir / "__init__.py")
+    return module
+
+
+def test_shadowed_venv_torch_is_reported(doctor, venv, tmp_path):
+    """The regression --fix walked into: it installed 2.11.0 into the venv,
+    pip said "Successfully installed", and `import torch` kept resolving to
+    /usr/local. Reported identically to before the repair, it reads as a
+    repair that did nothing."""
+    make_package(venv, "torch", "2.11.0")
+    system = make_package(tmp_path / "usr-local", "torch", "2.13.0+cu130")
+
+    assert doctor.check_shadowed_package(fake_module(system), "torch") is True
+
+    assert doctor._problems == [
+        "the venv's torch is installed but not the one being imported"]
+    assert doctor._fixes, "an uninstall of the shadowing copy should be offered"
+
+
+def test_pythonpath_shadowing_offers_no_uninstall(doctor, venv, tmp_path, monkeypatch, capsys):
+    """When PYTHONPATH is the cause, uninstalling is the wrong advice --
+    PYTHONPATH precedes every site directory, so the next install lands in
+    the same trap. Say so instead."""
+    make_package(venv, "torch", "2.11.0")
+    system = make_package(tmp_path / "usr-local", "torch", "2.13.0+cu130")
+    monkeypatch.setenv("PYTHONPATH", str(system.parent))
+
+    assert doctor.check_shadowed_package(fake_module(system), "torch") is True
+
+    assert doctor._fixes == []
+    out = capsys.readouterr().out
+    assert "unset PYTHONPATH" in out
+
+
+def test_no_shadowing_reported_when_the_venv_copy_is_the_one_imported(doctor, venv):
+    pkg = make_package(venv, "torch", "2.11.0")
+    assert doctor.check_shadowed_package(fake_module(pkg), "torch") is False
+    assert doctor._problems == []
+
+
+def test_no_shadowing_reported_when_the_venv_has_no_copy(doctor, venv, tmp_path):
+    """A system torch inherited through --system-site-packages is the normal,
+    intended arrangement on a Jetson -- not something to complain about."""
+    system = make_package(tmp_path / "usr-local", "torch", "2.5.0a0+nv24.08")
+    assert doctor.check_shadowed_package(fake_module(system), "torch") is False
+    assert doctor._problems == []
+
+
+def test_installed_version_falls_back_to_dist_info(doctor, tmp_path):
+    site = tmp_path / "sp"
+    pkg = site / "torch"
+    pkg.mkdir(parents=True)
+    (site / "torch-2.11.0.dist-info").mkdir()
+    assert doctor.installed_version(pkg) == "2.11.0"
+
+
+def test_torch_repair_is_offered_once_not_twice(doctor):
+    """Both the torch.cuda failure and the torchvision failure hand --fix the
+    same remedy. --fix dedupes by callable identity, so a fresh closure per
+    call meant 232 MB downloaded twice, the second install undoing the first.
+    """
+    first = doctor.install_matched_torch(12060)
+    second = doctor.install_matched_torch(12060)
+    assert first is second
+    assert doctor.install_matched_torch(12030) is not first
+
+
 def test_torchvision_is_checked_even_when_cuda_is_down(doctor, monkeypatch):
     """The regression this exists for.
 
