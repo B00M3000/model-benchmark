@@ -860,12 +860,24 @@ It probes the copies already present and stops at the first that imports:
 1. **Use the environment's own torch.** If the venv has its own torch and the
    interpreter the venv was built from has a working one, the venv copy is
    removed — torchvision with it, always, since a venv torchvision shadowing an
-   inherited torch is the `nms` error above. This is the usual answer, and the
-   only one that removes the mismatch rather than layering over it.
-2. **Supply the missing library.** `pip install nvidia-cudss-cu12 --no-deps`,
-   then symlink the `.so` into `torch/lib` — which is on torch's `_C` RPATH as
-   `$ORIGIN/lib`, so the loader finds it without `LD_LIBRARY_PATH` and
-   regardless of which `nvidia/*/lib` a given build has baked in.
+   inherited torch is the `nms` error above. This is the only strategy that
+   removes the mismatch rather than layering over it.
+2. **Link the library already on this machine.** Often it *is* here.
+   `libcupti.so.12` ships with JetPack — in
+   `/usr/local/cuda-*/extras/CUPTI/lib64`, which is not on the loader path and
+   not in `ld.so.conf`. So torch fails on a host that has the library, and
+   downloading another is the wrong instinct: the one already here matches this
+   CUDA exactly and only needs to be findable.
+3. **Download it.** `pip install nvidia-cuda-cupti-cu12 --no-deps` and friends,
+   as a last resort when the machine genuinely has no copy.
+
+Either link goes into `torch/lib`, which is on torch's `_C` RPATH as
+`$ORIGIN/lib` — so the loader finds it without `LD_LIBRARY_PATH` (the server
+and the engine builds launch separately and would each need the variable), and
+regardless of which `nvidia/*/lib` a given build baked in.
+
+The loader reports only the **first** library it cannot find, so this loops:
+supply one, re-probe, supply the next, until torch imports or nothing helps.
 
 Both scripts run it automatically, so `./scripts/setup_jetson.sh` and
 `./scripts/build_engines.sh` each cope with the switch on their own.

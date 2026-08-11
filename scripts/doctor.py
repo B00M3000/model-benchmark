@@ -558,6 +558,19 @@ def torchvision_cascade(exc: BaseException) -> bool:
     return name == "torchvision" or "torchvision" in str(exc)
 
 
+def cascade_root() -> str:
+    """Name the failure everything else was attributed to.
+
+    Not hardcoded to torchvision: it was, and a host whose torch could not load
+    libcupti got six reports summarised as "one root cause: torchvision" --
+    with torchvision never mentioned anywhere above, because the run never got
+    far enough to check it.
+    """
+    if _torch_missing_lib:
+        return f"torch cannot load {_torch_missing_lib}"
+    return "torchvision"
+
+
 def cascade_reason(exc: BaseException) -> str | None:
     """Explain `exc` as fallout from an already-reported failure, or None.
 
@@ -891,6 +904,10 @@ def check_nanosam_runtime() -> None:
         )
         return
     except ImportError as exc:
+        reason = cascade_reason(exc)
+        if reason:
+            report_cascade("nanosam.mobile_sam import failed", reason, warn)
+            return
         warn(
             "nanosam.mobile_sam import failed",
             str(exc).splitlines()[0],
@@ -1567,15 +1584,15 @@ def main() -> int:
         for problem in _problems:
             marker = "  ·"
             print(f"{marker} {problem}"
-                  + (f"  {DIM}(torchvision fallout){RESET}" if problem in _cascaded else ""))
+                  + (f"  {DIM}(fallout){RESET}" if problem in _cascaded else ""))
         # Counted against _problems, not against _cascaded: the optional
         # runtimes report their fallout as warnings, and those are not in the
         # list this line is describing.
         cascaded_here = [p for p in _problems if p in _cascaded]
         if cascaded_here:
             print(f"\n{DIM}{len(cascaded_here)} of these are one root cause: "
-                  f"torchvision. Repair it first -- the rest should clear on "
-                  f"their own.{RESET}")
+                  f"{cascade_root()}. Repair it first -- the rest should clear "
+                  f"on their own.{RESET}")
         if _fixes and not args.fix:
             print(f"\n{DIM}{len(_fixes)} of these can be attempted automatically: "
                   f"python3 scripts/doctor.py --fix{RESET}")

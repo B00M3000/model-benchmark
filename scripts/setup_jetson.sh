@@ -389,8 +389,25 @@ else
   # CLIP means PyPI torch landing on top of JetPack's build in the middle
   # of a benchmark run. CLIP declares torch and torchvision too, hence
   # --no-deps and its own three dependencies by name.
+  # find_spec, not `import clip`. clip/__init__.py does `from .clip import *`,
+  # and clip.py imports torch at module level -- so a broken torch makes a
+  # perfectly good CLIP look uninstalled, and this reinstalls it every run
+  # while reporting failure afterwards. spec.origin also rules out a bare
+  # directory named clip/ masquerading as a namespace package.
+  clip_installed() {
+    "$PYTHON" - <<'PYEOF' 2>/dev/null
+from importlib.util import find_spec
+import sys
+try:
+    spec = find_spec("clip")
+except BaseException:
+    spec = None
+sys.exit(0 if spec is not None and spec.origin else 1)
+PYEOF
+  }
+
   log "CLIP (encodes YOLO-World's prompts; pre-installed so ultralytics never self-installs it)"
-  if "$PYTHON" -c 'import clip' >/dev/null 2>&1; then
+  if clip_installed; then
     ok "already importable"
   else
     # --no-build-isolation is what makes the setuptools pin above take effect.
@@ -402,7 +419,7 @@ else
     "$PYTHON" -m pip install "git+https://github.com/ultralytics/CLIP.git" \
       --no-deps --no-build-isolation
     "$PYTHON" -m pip install ftfy regex tqdm
-    if "$PYTHON" -c 'import clip' >/dev/null 2>&1; then
+    if clip_installed; then
       ok "installed"
     else
       warn "CLIP did not install -- the YOLO-World pairings will be unavailable"

@@ -44,17 +44,52 @@ GREEN, YELLOW, RED, DIM, BOLD, RESET = (
 # yields one name per probe even when several are absent.
 MISSING_LIB = re.compile(r"(lib[\w.+-]+\.so[\d.]*): cannot open shared object file")
 
+# Where a CUDA library already on this machine is likely to be sitting.
+#
+# CUPTI is the reason this list exists and is checked before any download.
+# JetPack does ship libcupti.so.12 -- in /usr/local/cuda-*/extras/CUPTI/lib64,
+# which is not on the loader path and is not in ld.so.conf. So a torch that
+# links it fails on a host that has it, and "install the missing library" is
+# the wrong instinct: the right one is already here, matched to this CUDA, and
+# just needs to be findable.
+LIBRARY_SEARCH_GLOBS: tuple[str, ...] = (
+    "/usr/local/cuda*/extras/CUPTI/lib64/{name}",
+    "/usr/local/cuda*/targets/*/lib/{name}",
+    "/usr/local/cuda*/lib64/{name}",
+    "/usr/local/cuda*/lib/{name}",
+    "/usr/lib/aarch64-linux-gnu/{name}",
+    "/usr/lib/aarch64-linux-gnu/nvidia/{name}",
+    "/opt/nvidia/*/lib*/{name}",
+)
+
 # Shared libraries a CUDA-12 torch build may link that a JetPack image or a
 # container need not carry, mapped to the pip package that redistributes them.
-# Only libraries NVIDIA actually publishes as aarch64 wheels are listed --
-# offering to install something with no aarch64 artifact would just trade this
-# error for a resolver error.
+# The fallback for when the search above comes up empty. Only libraries NVIDIA
+# actually publishes as aarch64 wheels are listed -- offering to install
+# something with no aarch64 artifact just trades a loader error for a resolver
+# error.
 LIBRARY_WHEELS: dict[str, str] = {
     "libcudss.so": "nvidia-cudss-cu12",
     "libcusparseLt.so": "nvidia-cusparselt-cu12",
     "libcudnn.so": "nvidia-cudnn-cu12",
     "libnccl.so": "nvidia-nccl-cu12",
+    "libcupti.so": "nvidia-cuda-cupti-cu12",
+    "libcublas.so": "nvidia-cublas-cu12",
+    "libcublasLt.so": "nvidia-cublas-cu12",
+    "libcufft.so": "nvidia-cufft-cu12",
+    "libcurand.so": "nvidia-curand-cu12",
+    "libcusolver.so": "nvidia-cusolver-cu12",
+    "libcusparse.so": "nvidia-cusparse-cu12",
+    "libnvJitLink.so": "nvidia-nvjitlink-cu12",
+    "libcudart.so": "nvidia-cuda-runtime-cu12",
+    "libnvrtc.so": "nvidia-cuda-nvrtc-cu12",
+    "libnvToolsExt.so": "nvidia-nvtx-cu12",
 }
+
+# One round per missing library. The loader reports them one at a time, so a
+# torch missing three needs three passes -- but a chain longer than this is
+# not a missing-library problem and looping is not going to find that out.
+MAX_ROUNDS = 8
 
 _PROBE = r"""
 import json
@@ -191,17 +226,81 @@ def find_library(name: str) -> Path | None:
     return next(iter(sorted(root.glob(f"*/lib/{name}"))), None) if root.is_dir() else None
 
 
-def supply_missing_library(probe: Probe, dry_run: bool) -> bool:
-    """Install the wheel carrying the missing .so and put it where torch looks.
+# Overridable so the search can be pointed at a fixture tree in tests without
+# patching pathlib itself.
+SEARCH_ROOT = Path("/")
 
-    torch's `_C` extension carries an RPATH that includes `$ORIGIN/lib` -- the
-    `torch/lib` directory its own shared objects live in -- so a symlink there
-    is resolved by the loader without LD_LIBRARY_PATH, and without depending on
-    which `$ORIGIN/../../nvidia/*/lib` entries a particular build happens to
-    have baked in. That matters here: these wheels install under
-    `nvidia/cu12/lib`, and a build compiled against a different CUDA minor
-    looks in a differently-named sibling.
+
+def find_system_library(name: str, root: Path | None = None) -> Path | None:
+    """Locate `name` somewhere on this machine, outside the loader path.
+
+    Globbed against a fixed list rather than walked: a full filesystem search
+    on a Jetson's eMMC costs minutes, and every real location is known.
     """
+    base = root or SEARCH_ROOT
+    for pattern in LIBRARY_SEARCH_GLOBS:
+        for match in sorted(base.glob(pattern.format(name=name).lstrip("/"))):
+            if match.is_file():
+                return match
+    return None
+
+
+def link_into_torch(missing: str, source: Path, torch_dir: Path) -> bool:
+    """Put `source` where torch's own loader will find it.
+
+    torch's `_C` extension carries an RPATH including `$ORIGIN/lib` -- the
+    `torch/lib` directory its own shared objects live in -- so a symlink there
+    resolves without LD_LIBRARY_PATH, which matters because the server and the
+    engine builds are launched separately and would each need the variable set.
+    It also avoids depending on which `$ORIGIN/../../nvidia/*/lib` entries a
+    particular build baked in: the pip wheels install under `nvidia/cu12/lib`,
+    and a build compiled against another CUDA minor looks in a differently
+    named sibling.
+    """
+    target = torch_dir / "lib" / missing
+    if target.exists() or target.is_symlink():
+        target.unlink()
+    target.symlink_to(source)
+    ok(f"linked {missing}", f"{target} -> {source}")
+    return True
+
+
+def torch_lib_dir(probe: Probe) -> Path | None:
+    torch_dir = venv_package("torch") or (
+        Path(probe.path).parent if probe.path else None)
+    return torch_dir if torch_dir and (torch_dir / "lib").is_dir() else None
+
+
+def link_local_library(probe: Probe, dry_run: bool) -> bool:
+    """Use the copy already on this machine before downloading another.
+
+    Preferred over the pip wheel because it is the build matched to this
+    machine's CUDA, costs nothing, and works on a bench with no route out.
+    """
+    missing = probe.missing_lib
+    if missing is None:
+        return False
+
+    source = find_system_library(missing)
+    if source is None:
+        return False
+
+    torch_dir = torch_lib_dir(probe)
+    if torch_dir is None:
+        bad(f"cannot find torch/lib to place {missing} into")
+        return False
+
+    print(f"\n{BOLD}--> {missing} is already on this machine, just not on the "
+          f"loader path{RESET}")
+    ok("found", str(source))
+    if dry_run:
+        warn(f"--dry-run: would link it into {torch_dir / 'lib'}")
+        return False
+    return link_into_torch(missing, source, torch_dir)
+
+
+def supply_missing_library(probe: Probe, dry_run: bool) -> bool:
+    """Install the wheel carrying the missing .so, when this machine has none."""
     missing = probe.missing_lib
     if missing is None:
         return False
@@ -210,12 +309,11 @@ def supply_missing_library(probe: Probe, dry_run: bool) -> bool:
     package = LIBRARY_WHEELS.get(stem)
     if package is None:
         bad(f"no pip wheel known to carry {missing}",
-            "not one of: " + ", ".join(sorted(LIBRARY_WHEELS.values())))
+            "not one of: " + ", ".join(sorted(set(LIBRARY_WHEELS.values()))))
         return False
 
-    torch_dir = venv_package("torch") or (
-        Path(probe.path).parent if probe.path else None)
-    if torch_dir is None or not (torch_dir / "lib").is_dir():
+    torch_dir = torch_lib_dir(probe)
+    if torch_dir is None:
         bad(f"cannot find torch/lib to place {missing} into")
         return False
 
@@ -234,52 +332,66 @@ def supply_missing_library(probe: Probe, dry_run: bool) -> bool:
     if source is None:
         bad(f"{package} installed but {missing} is not in it")
         return False
-
-    target = torch_dir / "lib" / missing
-    if target.exists() or target.is_symlink():
-        target.unlink()
-    target.symlink_to(source)
-    ok(f"linked {missing}", f"{target} -> {source}")
-    return True
+    return link_into_torch(missing, source, torch_dir)
 
 
 STRATEGIES = (
     ("use the environment's own torch", drop_venv_torch),
+    ("link the library already on this machine", link_local_library),
     ("supply the missing library", supply_missing_library),
 )
 
 
+def report_success(probe: Probe) -> Probe:
+    ok("torch imports", probe.describe())
+    if not probe.cuda_available:
+        warn("torch has no usable CUDA",
+             probe.raw.get("cuda_error", "torch.cuda.is_available() is False"))
+    return probe
+
+
 def resolve(dry_run: bool = False) -> Probe:
+    """Keep going until torch imports, nothing helps, or we start repeating.
+
+    Looped, not a single pass: the dynamic loader names the *first* library it
+    cannot find and stops, so a torch missing three of them reports one, and
+    supplying it just reveals the next. Fixing one and reporting "still not
+    importing" would be technically true and useless -- it is the same problem,
+    one library further along.
+    """
     probe = probe_torch(sys.executable)
-    if probe.ok:
-        ok("torch imports", probe.describe())
-        if not probe.cuda_available:
-            warn("torch has no usable CUDA",
-                 probe.raw.get("cuda_error", "torch.cuda.is_available() is False"))
-        return probe
+    handled: set[str] = set()
 
-    bad("torch does not import", probe.error)
-    if probe.missing_lib:
-        print(f"    {DIM}Missing shared library: {probe.missing_lib}. torch itself "
-              f"is installed and intact -- it was built for an environment that "
-              f"has this library.{RESET}")
-
-    for label, strategy in STRATEGIES:
-        try:
-            changed = strategy(probe, dry_run)
-        except Exception as exc:  # a failed repair must not hide the diagnosis
-            bad(f"{label} failed", f"{type(exc).__name__}: {exc}")
-            continue
-        if not changed:
-            continue
-        probe = probe_torch(sys.executable)
+    for _ in range(MAX_ROUNDS):
         if probe.ok:
-            ok("torch imports", probe.describe())
-            if not probe.cuda_available:
-                warn("torch has no usable CUDA",
-                     probe.raw.get("cuda_error", "torch.cuda.is_available() is False"))
-            return probe
-        bad("still not importing after that", probe.error)
+            return report_success(probe)
+
+        bad("torch does not import", probe.error)
+        missing = probe.missing_lib
+        if missing:
+            print(f"    {DIM}Missing shared library: {missing}. torch itself is "
+                  f"installed and intact -- it was built for an environment that "
+                  f"has this library.{RESET}")
+            if missing in handled:
+                # Supplied once and still unresolved: linking it did not take,
+                # and going round again would just relink the same file.
+                bad(f"{missing} is still missing after being supplied",
+                    "the copy that was linked is not one this torch can use")
+                break
+            handled.add(missing)
+
+        changed = False
+        for label, strategy in STRATEGIES:
+            try:
+                changed = strategy(probe, dry_run)
+            except Exception as exc:  # a failed repair must not hide the diagnosis
+                bad(f"{label} failed", f"{type(exc).__name__}: {exc}")
+                continue
+            if changed:
+                break
+        if not changed:
+            break
+        probe = probe_torch(sys.executable)
 
     return probe
 

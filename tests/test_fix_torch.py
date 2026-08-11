@@ -191,6 +191,106 @@ def test_relinking_over_an_existing_file_succeeds(ft, monkeypatch, tmp_path):
         wheel_lib / "libcudss.so.0").resolve()
 
 
+def test_a_library_already_on_the_machine_is_preferred_over_a_download(
+        ft, monkeypatch, tmp_path):
+    """JetPack does ship libcupti.so.12 -- in cuda-*/extras/CUPTI/lib64, which
+    is not on the loader path. Downloading a 12.9 wheel to replace a 12.6
+    library that is already here, matched to this CUDA, is the wrong move."""
+    torch_dir = tmp_path / "site-packages" / "torch"
+    (torch_dir / "lib").mkdir(parents=True)
+    cupti = tmp_path / "usr/local/cuda-12.6/extras/CUPTI/lib64/libcupti.so.12"
+    cupti.parent.mkdir(parents=True)
+    cupti.write_bytes(b"\x7fELF")
+
+    monkeypatch.setattr(ft, "venv_package", lambda name: torch_dir if name == "torch" else None)
+    monkeypatch.setattr(ft, "find_system_library", lambda name: cupti)
+    monkeypatch.setattr(ft, "pip", lambda *a: pytest.fail("must not download"))
+
+    probe = ft.Probe(error="ImportError: libcupti.so.12: cannot open shared object file: x")
+    assert ft.link_local_library(probe, dry_run=False) is True
+    assert (torch_dir / "lib" / "libcupti.so.12").resolve() == cupti.resolve()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        # The one that matters: JetPack ships CUPTI here, off the loader path.
+        "usr/local/cuda-12.6/extras/CUPTI/lib64/libcupti.so.12",
+        "usr/local/cuda/extras/CUPTI/lib64/libcupti.so.12",
+        "usr/local/cuda-12.6/targets/aarch64-linux/lib/libcupti.so.12",
+        "usr/local/cuda-12.6/lib64/libcupti.so.12",
+        "usr/lib/aarch64-linux-gnu/libcupti.so.12",
+    ],
+)
+def test_local_search_looks_where_cuda_actually_puts_libraries(ft, tmp_path, relative):
+    """The glob list is the whole mechanism; a path missing from it finds
+    nothing silently and falls through to a needless download."""
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"\x7fELF")
+
+    assert ft.find_system_library("libcupti.so.12", root=tmp_path) == target
+
+
+def test_local_search_returns_none_when_absent(ft, tmp_path):
+    assert ft.find_system_library("libcupti.so.12", root=tmp_path) is None
+
+
+def test_local_search_ignores_a_directory_of_the_right_name(ft, tmp_path):
+    (tmp_path / "usr/local/cuda-12.6/lib64/libcupti.so.12").mkdir(parents=True)
+    assert ft.find_system_library("libcupti.so.12", root=tmp_path) is None
+
+
+def test_download_is_the_fallback_when_the_machine_has_none(ft, monkeypatch, tmp_path):
+    torch_dir = tmp_path / "site-packages" / "torch"
+    (torch_dir / "lib").mkdir(parents=True)
+    wheel_lib = tmp_path / "nvidia" / "cu12" / "lib"
+    wheel_lib.mkdir(parents=True)
+    (wheel_lib / "libcupti.so.12").write_bytes(b"\x7fELF")
+    installed: list = []
+
+    monkeypatch.setattr(ft, "venv_package", lambda name: torch_dir if name == "torch" else None)
+    monkeypatch.setattr(ft, "pip", lambda *a: installed.append(a) or True)
+    monkeypatch.setattr(ft, "find_library", lambda name: wheel_lib / name)
+
+    probe = ft.Probe(error="ImportError: libcupti.so.12: cannot open shared object file: x")
+    assert ft.supply_missing_library(probe, dry_run=False) is True
+    assert installed == [("install", "nvidia-cuda-cupti-cu12", "--no-deps")]
+
+
+def test_several_missing_libraries_are_resolved_in_one_run(ft, monkeypatch):
+    """The loader names the first library it cannot find and stops. Supplying
+    it reveals the next, so a single pass leaves torch just as broken."""
+    errors = [
+        "ImportError: libcupti.so.12: cannot open shared object file: x",
+        "ImportError: libcudss.so.0: cannot open shared object file: x",
+        "ImportError: libnccl.so.2: cannot open shared object file: x",
+    ]
+    probes = [ft.Probe(error=e) for e in errors] + [
+        ft.Probe(ok=True, version="2.11.0", path="/venv/torch/__init__.py",
+                 cuda_build="12.6", cuda_available=True)]
+    it = iter(probes)
+    linked: list[str] = []
+
+    monkeypatch.setattr(ft, "probe_torch", lambda python: next(it))
+    monkeypatch.setattr(ft, "STRATEGIES", (
+        ("link", lambda p, d: linked.append(p.missing_lib) is None or True),))
+
+    assert ft.resolve().ok is True
+    assert linked == ["libcupti.so.12", "libcudss.so.0", "libnccl.so.2"]
+
+
+def test_the_same_library_twice_stops_instead_of_looping(ft, monkeypatch, capsys):
+    """A strategy that reports success without actually resolving the library
+    would otherwise spin until MAX_ROUNDS, relinking the same file."""
+    same = ft.Probe(error="ImportError: libcupti.so.12: cannot open shared object file: x")
+    monkeypatch.setattr(ft, "probe_torch", lambda python: same)
+    monkeypatch.setattr(ft, "STRATEGIES", (("useless", lambda p, d: True),))
+
+    assert ft.resolve().ok is False
+    assert "still missing after being supplied" in capsys.readouterr().out
+
+
 def test_a_working_torch_is_left_alone(ft, monkeypatch):
     """The common case, and the one where doing anything is a bug."""
     monkeypatch.setattr(ft, "probe_torch", lambda python: ft.Probe(
